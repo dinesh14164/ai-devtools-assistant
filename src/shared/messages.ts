@@ -1,0 +1,216 @@
+export const PORT_NAME = "ai-devtools-panel";
+
+export interface CallFrame {
+  functionName: string;
+  url: string;
+  lineNumber: number;
+  columnNumber: number;
+}
+
+export interface CapturedRequest {
+  requestId: string;
+  url: string;
+  method: string;
+  type?: string;
+  status?: number;
+  mimeType?: string;
+  timestamp: number;
+  headers?: Record<string, string>; // request headers (M3: AI context)
+  initiatorType: string;
+  initiatorStack: CallFrame[]; // empty array if none
+}
+
+// ---- M4: breakpoints & pause inspection ----
+
+export interface BreakpointInfo {
+  breakpointId: string;
+  url: string; // generated (minified) script URL
+  lineNumber: number; // 0-based generated line (CDP convention)
+  columnNumber?: number;
+  originalLabel?: string; // e.g. "src/UserCard.tsx:34" when set via source map
+  bound: boolean; // false = pending (script not loaded / no location matched yet)
+}
+
+export interface PausedScope {
+  type: string; // "local" | "closure" | "global" | ...
+  objectId?: string;
+}
+
+export interface PausedFrame {
+  functionName: string;
+  scriptId: string;
+  url: string; // resolved from scriptId worker-side; "" if unknown
+  lineNumber: number; // 0-based
+  columnNumber: number;
+  scopeChain: PausedScope[];
+}
+
+export interface PausedSnapshot {
+  reason: string; // "other" for line breakpoints, "XHR" for XHR breakpoints, ...
+  detail?: string; // e.g. the matching URL for XHR pauses
+  hitBreakpoints: string[];
+  callFrames: PausedFrame[];
+}
+
+// ---- M4 patch: interaction breakpoints ----
+
+export interface EventBreakpointInfo {
+  eventName: string; // "click", "submit", ...
+  oneShot: boolean; // auto-clears after its first pause
+}
+
+export interface FunctionBreakpointInfo {
+  id: string; // CDP breakpointId from setBreakpointOnFunctionCall
+  label: string; // e.g. `click handler on button#save`
+}
+
+export interface ListenerInfo {
+  type: string; // event type, e.g. "click"
+  useCapture: boolean;
+  handlerObjectId?: string; // the handler function's objectId (breakable)
+  description: string; // handler function preview
+  node: string; // where it's attached, e.g. "button#save.btn" / "#document"
+  origin: "element" | "ancestor" | "document";
+}
+
+// ---- M4 enhancement: framework-aware handler detection ----
+
+export type FrameworkId = "react" | "angular" | "vue" | "vanilla";
+
+export interface FrameworkResolution {
+  framework: FrameworkId | "unknown";
+  confidence: "high" | "low";
+  source: "override" | "detected";
+}
+
+export interface ExtractedHandler {
+  handlerObjectId: string; // the REAL handler function (bound fns unwrapped)
+  description: string; // function preview
+  via: string; // how it was found, e.g. "React onClick prop"
+  url?: string; // generated script URL from [[FunctionLocation]]
+  lineNumber?: number; // 0-based generated
+  columnNumber?: number;
+}
+
+export interface RemoteProperty {
+  name: string;
+  type: string; // "string" | "number" | "object" | "function" | ... (subtype-qualified)
+  description?: string; // printable value / preview
+  objectId?: string; // present => expandable
+}
+
+// ---- M5: screenshots, element picker, source reading ----
+
+export interface PickedElement {
+  tagName: string;
+  id?: string;
+  classList: string[];
+  attributes: Record<string, string>;
+  outerHTMLTruncated: string;
+  selector: string;
+  // Page-absolute CSS pixels (getBoundingClientRect + scroll offset) so the
+  // rect can be used directly as a Page.captureScreenshot clip.
+  rect: { x: number; y: number; width: number; height: number };
+  computedStyles: Record<string, string>; // curated subset
+}
+
+/** Runtime messages sent by the injected picker (content script -> worker). */
+export type PickerMessage =
+  | { type: "element-picked"; payload: PickedElement }
+  | { type: "picker-cancelled" };
+
+export interface ScriptInfo {
+  scriptId: string;
+  url: string;
+  hasSourceMap: boolean;
+}
+
+export type ScreenshotMode = "viewport" | "fullpage" | "clip";
+
+export type PanelToBg =
+  | { type: "get-status" }
+  | { type: "clear-requests" }
+  | { type: "reattach-active-tab" }
+  | {
+      type: "set-breakpoint";
+      url: string;
+      lineNumber: number; // 0-based generated line
+      columnNumber?: number;
+      originalLabel?: string;
+    }
+  | { type: "remove-breakpoint"; breakpointId: string }
+  | { type: "set-xhr-breakpoint"; url: string } // substring match; "" = all requests
+  | { type: "remove-xhr-breakpoint"; url: string }
+  | { type: "resume" }
+  | { type: "step-over" }
+  | { type: "step-into" }
+  | { type: "step-out" }
+  | { type: "get-properties"; objectId: string; requestToken: number }
+  | {
+      type: "capture-screenshot";
+      mode: ScreenshotMode;
+      clip?: { x: number; y: number; width: number; height: number };
+      requestToken: number;
+    }
+  | { type: "activate-picker" }
+  | { type: "get-scripts" }
+  | { type: "get-script-source"; scriptId: string; requestToken: number }
+  | { type: "set-event-breakpoint"; eventName: string; oneShot: boolean }
+  | { type: "remove-event-breakpoint"; eventName: string }
+  | { type: "set-function-breakpoint"; handlerObjectId: string; label: string }
+  | { type: "remove-function-breakpoint"; id: string }
+  | { type: "get-framework"; requestToken: number }
+  | {
+      type: "set-framework-override";
+      framework: FrameworkId | "auto";
+      requestToken: number;
+    }
+  | {
+      type: "extract-handler";
+      selector: string;
+      eventType: string;
+      framework: FrameworkId;
+      requestToken: number;
+    }
+  | { type: "set-blackbox-patterns"; patterns: string[] };
+
+export type BgToPanel =
+  | {
+      type: "status";
+      attached: boolean;
+      tabId: number | null;
+      tabTitle?: string;
+      error?: string;
+    }
+  | { type: "request-added"; request: CapturedRequest }
+  | { type: "request-updated"; requestId: string; status?: number; mimeType?: string }
+  | { type: "requests-cleared" }
+  | { type: "requests-snapshot"; requests: CapturedRequest[] }
+  | {
+      type: "breakpoints";
+      breakpoints: BreakpointInfo[];
+      xhrBreakpoints: string[];
+      eventBreakpoints: EventBreakpointInfo[];
+      functionBreakpoints: FunctionBreakpointInfo[];
+    }
+  | { type: "breakpoint-error"; error: string }
+  | { type: "paused"; state: PausedSnapshot }
+  | { type: "resumed" }
+  | {
+      type: "properties";
+      requestToken: number;
+      properties: RemoteProperty[];
+      error?: string;
+    }
+  | { type: "screenshot"; requestToken: number; dataUrl?: string; error?: string }
+  | { type: "element-picked"; payload: PickedElement }
+  | { type: "picker-cancelled" }
+  | { type: "scripts"; scripts: ScriptInfo[] }
+  | { type: "script-source"; requestToken: number; source?: string; error?: string }
+  | { type: "framework"; requestToken: number; resolution: FrameworkResolution }
+  | {
+      type: "handler-candidates";
+      requestToken: number;
+      candidates: ExtractedHandler[];
+      error?: string;
+    };
