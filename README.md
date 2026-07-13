@@ -13,6 +13,9 @@ The tool is **provider-agnostic**: you connect any OpenAI-compatible model (Kimi
 - **Framework-aware handler breakpoints** — pick a button (or any element) and the tool finds the *real* handler behind React/Angular/Vue event delegation and breaks inside it — not in framework internals.
 - **XHR / event breakpoints** — pause when a request matching a URL fires, or on a specific element's handler.
 - **GraphQL operation-scoped breakpoints** — GraphQL operations share one endpoint, so URL breakpoints pause on everything; instead, arm "Break when operation `GetUser` fires" and only that operation pauses (main-world fetch/XHR instrumentation with a conditional `debugger;`). Batched and persisted queries supported.
+- **Reload & capture** — the panel normally attaches after the page loaded, missing init-time requests; "⟳ Reload & capture" re-arms persisted breakpoints and hooks *before* the app bootstraps, then reloads. Per-site "auto-capture on reload" re-arms on every navigation.
+- **Request-triggered discovery** — pause on an init-time request (XHR or GraphQL breakpoint) and the paused view classifies the whole chain — async parents included — dimming framework frames and marking the **entry point**: the outermost frame in *your* code (e.g. the lifecycle hook that started the chain). Break on any frame in the chain.
+- **Break on lifecycle** — scan your own sources for lifecycle hooks (`ngOnInit`, `useEffect`, `mounted`, … — editable lists) and arm breakpoints on them directly; deterministic even when async chains break.
 - **AI explanations** — send any captured context (request, paused state, element, screenshot, source snippet) to your active model and get a plain-language explanation.
 - **Context sources** — screenshots (viewport / full page / element clip), an element picker with computed styles, and a source viewer with pretty-printing.
 
@@ -110,7 +113,10 @@ src/
 └── sidepanel/      # React UI
     ├── App.tsx               # view shell, port wiring, attachment flows
     ├── Chat.tsx              # streaming chat + attachment tray
-    ├── Debugger.tsx          # breakpoints, paused view, interaction breaks
+    ├── Debugger.tsx          # breakpoints, paused view / reasoning panel
+    ├── LifecyclePanel.tsx    # lifecycle-hook scan + breakpoints
+    ├── codeClassifier.ts     # shared "my code" frame classifier
+    ├── lifecycleScan.ts      # lifecycle-hook source scanning helpers
     ├── Settings.tsx          # model profiles + system prompt
     ├── SourcesView.tsx       # script list + source viewer (pretty-print)
     ├── sourceMapResolver.ts  # source-map resolution + consumer cache
@@ -130,6 +136,8 @@ src/
 - Handler (function-call) breakpoints bind to the function *object* — a page reload or hot-reload silently orphans them; re-pick after reloads.
 - Only one debugger client per tab — the native Sources-tab debugger can't run on the same tab while the extension is attached.
 - GraphQL operation breakpoints match **string** request bodies only (FormData/Blob/stream bodies and raw `application/graphql` text are skipped). If a client captured `fetch` before the hook was armed, reload the page once — the pre-load registration then guarantees coverage.
+- Request-triggered discovery depends on the **async parent chain** reaching back to your code; `zone.js` (Angular) and long RxJS pipelines can break it. The panel detects this and points at the fixes (higher async stack depth, "Break on lifecycle").
+- The lifecycle scan is a line-based identifier search over your sources, not a parser — expect occasional false positives (e.g. a string containing a hook name) alongside real definitions and call sites.
 
 ---
 

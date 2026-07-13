@@ -1,3 +1,34 @@
+# Release 3 — v1.2.0 (2026-07-13)
+
+## Lifecycle & load-time request debugging
+
+Two fixes for requests that fire with **no interaction at all** — app bootstrap, route resolvers, and component lifecycle hooks (`ngOnInit`, `useEffect`, `mounted`, …).
+
+### Reload & capture (the debugger was attaching too late)
+
+The panel used to attach after the page had loaded, so init-time requests were uncatchable. Now:
+
+- **"⟳ Reload & capture"** re-arms everything *before* the app bootstraps — persisted breakpoints, in-page hooks (GraphQL), async depth, blackbox — then reloads, capturing from the very first request. Pre-load breakpoints show as *pending* until their scripts parse.
+- **Breakpoint definitions persist per-origin** (source-line, XHR, GraphQL-operation) and are re-armed automatically.
+- **"Auto-capture on reload"** toggle (saved per site) re-arms on every navigation so you never have to click again.
+- Attaching to an **already-loaded** page shows an explicit hint ("init-time requests were missed — use Reload & capture") instead of a baffling empty list.
+
+### Request-triggered discovery (find the code that started the chain)
+
+The paused view is now a **reasoning panel**: every frame is classified as *your code* vs *framework* (driven by the ignore/blackbox list — nothing app-specific), framework frames are dimmed, async boundaries render as dividers, and the **entry point** — the outermost user-code frame, e.g. the lifecycle hook that started the chain — is marked with ▶. Arm an XHR or GraphQL-operation breakpoint on an init-time request (plus Reload & capture) and the pause shows the whole chain back to your component; any frame is individually breakable ("break here instead"), so the next load pauses directly in your code.
+
+- `Debugger.paused` stacks now include **async parent frames** (they were dropped before), flattened like the M1 initiator stacks.
+- **Async stack depth is configurable** (32 / 64 / 128, default 64, persisted) — deep lifecycle→service→RxJS→fetch chains need it; higher values cost page performance.
+- **Broken chains fail loudly:** when no frame classifies as your code (zone.js and long RxJS pipelines are the usual culprits), the panel explains why and links the fixes inline — raise async depth, use Break on lifecycle, or ask the active model (clearly-labeled heuristic, only offered when classification fails).
+
+### Break on lifecycle (deterministic fallback)
+
+A **"Break on lifecycle"** panel scans *your own* sources (ignore-list files excluded; original files via source maps, generated text when unmapped) for lifecycle hook occurrences — framework-aware default name lists (Angular/React/Vue), user-editable and saved — and arms ordinary source-line breakpoints on them, including a bulk **"Break on ALL `<hook>`"** option with a one-click "Clear lifecycle breakpoints". Immune to async-chain breakage: it breaks at the definition instead of tracing back from the request.
+
+Interaction-triggered discovery (element handler picking, event breakpoints, AI fallback) is unchanged — this adds the request-triggered path alongside it.
+
+---
+
 # Release 2 — v1.1.0 (2026-07-13)
 
 ## GraphQL operation-scoped breakpoints

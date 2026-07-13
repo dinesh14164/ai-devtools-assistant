@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type {
   BreakpointInfo,
   EventBreakpointInfo,
@@ -11,11 +11,19 @@ import type {
   PausedFrame,
   PausedSnapshot,
   RemoteProperty,
+  ScriptInfo,
 } from "../shared/messages";
 import {
   resolveOriginalLocation,
   type OriginalLocation,
 } from "./sourceMapResolver";
+import {
+  classifyFrame,
+  compileIgnorePatterns,
+  findEntryPointIndex,
+  type FrameClass,
+} from "./codeClassifier";
+import LifecyclePanel from "./LifecyclePanel";
 
 export const DEFAULT_PAUSE_QUESTION =
   "Execution paused here. Explain what this code is doing and what the current variable values suggest. Point out anything that looks like the cause of a bug.";
@@ -42,6 +50,11 @@ interface DebuggerProps {
   askFramework: boolean;
   paused: PausedSnapshot | null;
   breakpointError: string | null;
+  // ---- M7: lifecycle & load-time discovery ----
+  scripts: ScriptInfo[];
+  refreshScripts: () => void;
+  getScriptSource: (scriptId: string) => Promise<string>;
+  asyncDepth?: number;
   send: (msg: PanelToBg) => void;
   fetchProperties: (objectId: string) => Promise<RemoteProperty[]>;
   onExplain: (prefillText: string) => void;
@@ -212,6 +225,10 @@ export default function Debugger({
   askFramework,
   paused,
   breakpointError,
+  scripts,
+  refreshScripts,
+  getScriptSource,
+  asyncDepth,
   send,
   fetchProperties,
   onExplain,
@@ -255,6 +272,55 @@ export default function Debugger({
       cancelled = true;
     };
   }, [paused]);
+
+  // ---- M7: shared discovery pipeline (classifier → entry point → arm) ----
+  // The classifier runs on EVERY pause's stack; only the trigger differs
+  // (interaction breakpoints step in early, request breakpoints — XHR/GraphQL
+  // — already have the whole chain on the stack, async parents included).
+  const ignoreList = useMemo(
+    () => blackboxText.split(/[\n,]/).map((p) => p.trim()).filter(Boolean),
+    [blackboxText],
+  );
+  const compiledIgnore = useMemo(() => compileIgnorePatterns(ignoreList), [ignoreList]);
+  // Classification uses resolved original paths when available; hold off on
+  // entry-point/guidance verdicts until the whole stack resolved.
+  const chainResolved =
+    paused !== null && frameLocations.length === paused.callFrames.length;
+  const frameClasses: FrameClass[] = useMemo(
+    () =>
+      paused
+        ? paused.callFrames.map((f, i) =>
+            classifyFrame(f, frameLocations[i]?.source ?? null, compiledIgnore),
+          )
+        : [],
+    [paused, frameLocations, compiledIgnore],
+  );
+  // Entry point = OUTERMOST user-code frame (walk from the deepest async
+  // parent inward): the function in the developer's code that started the
+  // chain — for init-time requests, typically the lifecycle hook.
+  const entryIdx = chainResolved ? findEntryPointIndex(frameClasses) : -1;
+  const isRequestPause =
+    paused?.reason === "XHR" || paused?.reason === "GraphQLOperation";
+  const chainBroken = chainResolved && isRequestPause && entryIdx === -1;
+
+  // Part 5: narrow AI assist — offered ONLY when the classifier found no user
+  // frame; presented as a heuristic suggestion, answered by the active model.
+  const askAiForEntryPoint = () => {
+    if (!paused) return;
+    const stackLines = paused.callFrames.map(
+      (f, i) => `  ${frameLabel(f, frameLocations[i] ?? null)}`,
+    );
+    onExplain(
+      `[Heuristic — AI suggestion, please verify] Execution paused on a request ` +
+        `(${paused.reason}${paused.detail ? `: ${paused.detail}` : ""}), but no frame in the ` +
+        `stack classifies as my own code (framework: ${framework?.framework ?? "unknown"}). ` +
+        `From the call chain below (innermost first; "[async: …]" rows are async boundaries), ` +
+        `which frame is most likely MY application's entry point — the function in my code ` +
+        `that started this chain — rather than framework internals? Name the function and ` +
+        `file:line so I can set a breakpoint there (⏸ button in the Debug tab).\n\n` +
+        `Call chain:\n${stackLines.join("\n")}`,
+    );
+  };
 
   const addXhrBreakpoint = () => {
     const url = xhrInput.trim();
@@ -315,6 +381,15 @@ export default function Debugger({
       paused.callFrames.forEach((f, i) => {
         lines.push(`  ${frameLabel(f, frameLocations[i] ?? null)}`);
       });
+      if (entryIdx >= 0) {
+        lines.push(
+          "",
+          `Entry point in my own code (outermost non-framework frame): ${frameLabel(
+            paused.callFrames[entryIdx],
+            frameLocations[entryIdx] ?? null,
+          )}`,
+        );
+      }
 
       const frame = paused.callFrames[selectedFrame];
       const localScope =
@@ -367,24 +442,60 @@ export default function Debugger({
             </button>
           </div>
 
-          <h3 className="mt-2 text-xs font-semibold text-gray-700">Call stack</h3>
+          <h3 className="mt-2 text-xs font-semibold text-gray-700">
+            Call chain{" "}
+            <span className="font-normal text-gray-500">
+              (framework dimmed{entryIdx >= 0 ? ", ▶ = entry point in your code" : ""})
+            </span>
+          </h3>
           <ul className="mt-0.5">
             {paused.callFrames.map((f, i) => {
               const loc = frameLocations[i] ?? null;
+              const cls = frameClasses[i];
+              // Async boundary rows are dividers, not selectable frames.
+              if (cls === "separator") {
+                return (
+                  <li
+                    key={i}
+                    className="border-t border-dashed border-gray-300 py-0.5 pl-1 font-mono text-[11px] italic text-gray-400"
+                  >
+                    {f.functionName}
+                  </li>
+                );
+              }
+              const isEntry = chainResolved && i === entryIdx;
               return (
-                <li key={i} className="flex items-center gap-1">
+                <li
+                  key={i}
+                  className={`flex items-center gap-1 ${isEntry ? "rounded bg-emerald-50" : ""}`}
+                >
                   <button
                     className={`min-w-0 flex-1 break-all px-1 py-0.5 text-left font-mono text-xs ${
                       i === selectedFrame ? "bg-blue-100" : "hover:bg-gray-100"
-                    }`}
+                    } ${cls === "framework" ? "text-gray-400" : ""}`}
+                    title={
+                      cls === "framework"
+                        ? "framework / ignored code"
+                        : "your code — click to inspect, ⏸ to break here instead"
+                    }
                     onClick={() => setSelectedFrame(i)}
                   >
+                    {isEntry && (
+                      <span className="mr-1 rounded bg-emerald-600 px-1 py-px align-middle text-[10px] font-semibold text-white">
+                        ▶ entry
+                      </span>
+                    )}
+                    {chainResolved && cls === "user" && !isEntry && (
+                      <span className="mr-1 rounded bg-emerald-100 px-1 py-px align-middle text-[10px] font-semibold text-emerald-700">
+                        your code
+                      </span>
+                    )}
                     {frameLabel(f, loc)}
                   </button>
                   {f.url && (
                     <button
                       className="shrink-0 rounded bg-gray-200 px-1 text-[10px] hover:bg-gray-300"
-                      title="Set a breakpoint at this frame for subsequent runs"
+                      title="Set a permanent breakpoint at this frame — subsequent loads pause directly here"
                       onClick={() =>
                         send({
                           type: "set-breakpoint",
@@ -402,6 +513,55 @@ export default function Debugger({
               );
             })}
           </ul>
+
+          {chainBroken && (
+            <div className="mt-2 rounded border border-amber-400 bg-amber-100/70 p-2 text-xs">
+              <p className="font-medium text-amber-900">
+                The async chain didn't reach your code — the request was
+                scheduled across boundaries the debugger couldn't trace (zone.js
+                and long RxJS pipelines are common causes). Try increasing async
+                stack depth, or use "Break on lifecycle" to break at the hook
+                directly.
+              </p>
+              <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                <label className="flex items-center gap-1 text-gray-700">
+                  Async depth:
+                  <select
+                    className="rounded border border-gray-300 px-1 py-0.5 text-xs"
+                    value={String(asyncDepth ?? 64)}
+                    onChange={(e) =>
+                      send({ type: "set-async-depth", maxDepth: Number(e.target.value) })
+                    }
+                  >
+                    {[...new Set([32, 64, 128, asyncDepth ?? 64])]
+                      .sort((a, b) => a - b)
+                      .map((d) => (
+                        <option key={d} value={d}>
+                          {d}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+                <button
+                  className={btnClass}
+                  onClick={() =>
+                    document
+                      .getElementById("lifecycle-panel")
+                      ?.scrollIntoView({ behavior: "smooth" })
+                  }
+                >
+                  Break on lifecycle ↓
+                </button>
+                <button
+                  className="rounded bg-violet-600 px-2 py-1 text-xs font-medium text-white hover:bg-violet-700"
+                  title="Heuristic: asks your active model which frame is your entry point — confirm before trusting"
+                  onClick={askAiForEntryPoint}
+                >
+                  Ask AI to find my entry point
+                </button>
+              </div>
+            </div>
+          )}
 
           <h3 className="mt-2 text-xs font-semibold text-gray-700">Scope</h3>
           {paused.callFrames[selectedFrame]?.scopeChain
@@ -442,6 +602,11 @@ export default function Debugger({
               >
                 {b.bound ? "bound" : "pending"}
               </span>
+              {b.tag === "lifecycle" && (
+                <span className="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">
+                  lifecycle
+                </span>
+              )}
               <span className="min-w-0 flex-1 break-all font-mono">
                 {b.originalLabel ?? `${b.url}:${b.lineNumber}`}
                 {b.originalLabel && (
@@ -473,6 +638,42 @@ export default function Debugger({
           <button className={btnClass} onClick={addRawBreakpoint}>
             Add raw
           </button>
+        </div>
+        {breakpoints.some((b) => b.tag === "lifecycle") && (
+          <button
+            className="mt-2 rounded bg-red-100 px-2 py-1 text-xs font-medium text-red-700 hover:bg-red-200"
+            onClick={() =>
+              breakpoints
+                .filter((b) => b.tag === "lifecycle")
+                .forEach((b) =>
+                  send({ type: "remove-breakpoint", breakpointId: b.breakpointId }),
+                )
+            }
+          >
+            Clear lifecycle breakpoints
+          </button>
+        )}
+        <div className="mt-2 flex items-center gap-2 text-xs text-gray-600">
+          <span>Async stack depth:</span>
+          <select
+            className="rounded border border-gray-300 px-1 py-0.5 text-xs"
+            title="How far Debugger.paused stacks reach back across async boundaries — deeper chains reconstruct lifecycle→request paths but cost page performance"
+            value={String(asyncDepth ?? 64)}
+            onChange={(e) =>
+              send({ type: "set-async-depth", maxDepth: Number(e.target.value) })
+            }
+          >
+            {[...new Set([32, 64, 128, asyncDepth ?? 64])]
+              .sort((a, b) => a - b)
+              .map((d) => (
+                <option key={d} value={d}>
+                  {d}
+                </option>
+              ))}
+          </select>
+          <span className="text-[11px] text-gray-400">
+            deeper chains, slower page
+          </span>
         </div>
       </section>
 
@@ -734,6 +935,15 @@ export default function Debugger({
           </button>
         </details>
       </section>
+
+      <LifecyclePanel
+        scripts={scripts}
+        refreshScripts={refreshScripts}
+        getScriptSource={getScriptSource}
+        framework={framework}
+        ignorePatterns={ignoreList}
+        send={send}
+      />
 
       <section>
         <h2 className="font-semibold">XHR / fetch / GraphQL breakpoints</h2>

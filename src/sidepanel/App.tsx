@@ -48,6 +48,9 @@ interface Status {
   tabId: number | null;
   tabTitle?: string;
   error?: string;
+  alreadyLoaded?: boolean; // attached after the page finished loading (M7)
+  autoCapture?: boolean;
+  asyncDepth?: number;
 }
 
 type View = "network" | "debug" | "sources" | "chat" | "settings";
@@ -215,6 +218,9 @@ export default function App() {
             tabId: msg.tabId,
             tabTitle: msg.tabTitle,
             error: msg.error,
+            alreadyLoaded: msg.alreadyLoaded,
+            autoCapture: msg.autoCapture,
+            asyncDepth: msg.asyncDepth,
           });
           break;
         case "request-added":
@@ -698,8 +704,42 @@ export default function App() {
           )}
         </div>
         {status.error && <p className="mt-1 text-red-600">{status.error}</p>}
+        {status.attached && status.alreadyLoaded && (
+          <div className="mt-2 rounded border border-amber-300 bg-amber-50 p-2 text-xs">
+            <span className="font-medium text-amber-800">
+              This page already loaded — init-time requests (bootstrap, lifecycle
+              hooks) were missed. Use "Reload &amp; capture" to catch them.
+            </span>
+            <button
+              className="ml-2 rounded bg-amber-600 px-2 py-0.5 font-medium text-white hover:bg-amber-700"
+              onClick={() => send({ type: "reload-and-capture" })}
+            >
+              ⟳ Reload &amp; capture
+            </button>
+          </div>
+        )}
         {status.attached && (
-          <div className="mt-2 flex flex-wrap gap-2">
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <button
+              className="rounded bg-blue-600 px-2 py-1 text-xs font-medium text-white hover:bg-blue-700"
+              title="Re-arm all persisted breakpoints and in-page hooks, then reload — capture starts from the very first request"
+              onClick={() => send({ type: "reload-and-capture" })}
+            >
+              ⟳ Reload &amp; capture
+            </button>
+            <label
+              className="flex items-center gap-1 text-xs text-gray-600"
+              title="Re-arm hooks and persisted breakpoints automatically on every navigation/reload (saved for this site)"
+            >
+              <input
+                type="checkbox"
+                checked={status.autoCapture ?? false}
+                onChange={(e) =>
+                  send({ type: "set-auto-capture", enabled: e.target.checked })
+                }
+              />
+              Auto-capture on reload
+            </label>
             <button
               className="rounded bg-gray-200 px-2 py-1 text-xs font-medium text-gray-800 hover:bg-gray-300"
               onClick={() => void takeScreenshot("viewport", "viewport screenshot")}
@@ -1020,6 +1060,10 @@ export default function App() {
           askFramework={askFramework}
           paused={paused}
           breakpointError={breakpointError}
+          scripts={scripts}
+          refreshScripts={() => send({ type: "get-scripts" })}
+          getScriptSource={getScriptSource}
+          asyncDepth={status.asyncDepth}
           send={send}
           fetchProperties={fetchProperties}
           onExplain={(text) => {

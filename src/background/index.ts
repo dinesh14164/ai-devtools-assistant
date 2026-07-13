@@ -86,6 +86,9 @@ interface PausedParams {
     location: { scriptId: string; lineNumber: number; columnNumber?: number };
     scopeChain: { type: string; object: RemoteObject }[];
   }[];
+  // M7: async parents of the paused stack (Runtime.StackTrace — same shape as
+  // the initiator StackNode). Present when setAsyncCallStackDepth > 0.
+  asyncStackTrace?: StackNode;
 }
 
 interface SetBreakpointResult {
@@ -126,6 +129,35 @@ let gqlHookInstalled = false;
 const scripts = new Map<string, ScriptInfo>(); // scriptId -> info
 let pausedState: PausedSnapshot | null = null;
 
+// ---- M7: lifecycle & load-time capture ----
+// The panel usually attaches AFTER the page loaded, so init-time requests
+// (bootstrap, lifecycle hooks) fired before we were listening. "Reload &
+// capture" re-arms everything and reloads so capture starts from the first
+// request; breakpoint definitions persist per-origin so they can be re-armed
+// before the app bootstraps.
+const CAPTURE_KEY = "captureByOrigin"; // { [origin]: { autoCapture: boolean } }
+const PERSISTED_BP_KEY = "breakpointsByOrigin";
+const ASYNC_DEPTH_KEY = "asyncStackDepth"; // global setting
+const DEFAULT_ASYNC_DEPTH = 64; // lifecycle→service→RxJS→fetch chains are deep
+let asyncDepth = DEFAULT_ASYNC_DEPTH;
+let autoCapture = false; // loaded per-origin on attach
+let alreadyLoaded = false; // attached to a page that had finished loading
+// Suppresses per-mutation persistence writes while re-arming from the store
+// (each setBreakpoint call would otherwise overwrite the store with a subset).
+let rearming = false;
+
+interface PersistedBreakpoints {
+  lines: {
+    url: string;
+    lineNumber: number;
+    columnNumber?: number;
+    originalLabel?: string;
+    tag?: string;
+  }[];
+  xhr: string[];
+  gqlOps: GqlOpBreakpointInfo[];
+}
+
 function post(msg: BgToPanel) {
   port?.postMessage(msg);
 }
@@ -137,6 +169,9 @@ function pushStatus(error?: string) {
     tabId: attachedTabId,
     tabTitle: attachedTabTitle,
     error,
+    alreadyLoaded,
+    autoCapture,
+    asyncDepth,
   });
 }
 
@@ -225,9 +260,12 @@ async function attach(tabId: number) {
     await chrome.debugger.sendCommand({ tabId }, "Runtime.enable");
     await chrome.debugger.sendCommand({ tabId }, "Page.enable"); // screenshots (M5)
     // Without this, initiator stacks stop at the synchronous frames — no
-    // await / .then() / setTimeout chain.
+    // await / .then() / setTimeout chain. Depth is user-configurable (M7):
+    // lifecycle chains (hook → service → RxJS → fetch) need more than the
+    // old default of 32; higher values cost performance.
+    asyncDepth = await loadAsyncDepth();
     await chrome.debugger.sendCommand({ tabId }, "Debugger.setAsyncCallStackDepth", {
-      maxDepth: 32,
+      maxDepth: asyncDepth,
     });
     attachedTabId = tabId;
     // Blackbox patterns are per-session; re-apply the last set on re-attach.
@@ -237,9 +275,51 @@ async function attach(tabId: number) {
     } catch {
       attachedTabTitle = undefined;
     }
+    // M7: if the page already finished loading, its init-time requests fired
+    // before we attached — the panel shows a "Reload & capture" hint.
+    alreadyLoaded = await detectAlreadyLoaded();
+    autoCapture = await loadAutoCapture();
+    if (autoCapture) {
+      await rearmPersistedBreakpoints();
+      await syncGqlHook();
+    }
     pushStatus();
   } catch (e) {
     pushStatus(e instanceof Error ? e.message : String(e));
+  }
+}
+
+async function detectAlreadyLoaded(): Promise<boolean> {
+  try {
+    const res = await sendCdp<{ result: RemoteObject }>("Runtime.evaluate", {
+      expression: "document.readyState",
+      returnByValue: true,
+    });
+    return res.result?.value === "interactive" || res.result?.value === "complete";
+  } catch {
+    return false;
+  }
+}
+
+async function loadAsyncDepth(): Promise<number> {
+  try {
+    const stored = await chrome.storage.local.get(ASYNC_DEPTH_KEY);
+    const depth = Number(stored[ASYNC_DEPTH_KEY]);
+    return Number.isInteger(depth) && depth > 0 ? Math.min(depth, 256) : DEFAULT_ASYNC_DEPTH;
+  } catch {
+    return DEFAULT_ASYNC_DEPTH;
+  }
+}
+
+async function loadAutoCapture(): Promise<boolean> {
+  const origin = await getTabOrigin();
+  if (!origin) return false;
+  try {
+    const stored = await chrome.storage.local.get(CAPTURE_KEY);
+    const byOrigin = (stored[CAPTURE_KEY] ?? {}) as Record<string, { autoCapture?: boolean }>;
+    return byOrigin[origin]?.autoCapture === true;
+  } catch {
+    return false;
   }
 }
 
@@ -249,6 +329,8 @@ async function detach() {
   const tabId = attachedTabId;
   attachedTabId = null;
   attachedTabTitle = undefined;
+  alreadyLoaded = false;
+  autoCapture = false;
   clearRequests();
   clearDebugSessionState();
   try {
@@ -288,6 +370,7 @@ async function setBreakpoint(msg: {
   lineNumber: number;
   columnNumber?: number;
   originalLabel?: string;
+  tag?: string;
 }) {
   try {
     const result = await sendCdp<SetBreakpointResult>("Debugger.setBreakpointByUrl", {
@@ -301,11 +384,13 @@ async function setBreakpoint(msg: {
       lineNumber: msg.lineNumber,
       columnNumber: msg.columnNumber,
       originalLabel: msg.originalLabel,
+      tag: msg.tag,
       // Empty locations = didn't bind yet (script not loaded); it may still
       // bind later via Debugger.breakpointResolved.
       bound: result.locations.length > 0,
     });
     pushBreakpoints();
+    void persistSessionBreakpoints();
   } catch (e) {
     post({
       type: "breakpoint-error",
@@ -322,6 +407,7 @@ async function removeBreakpoint(breakpointId: string) {
     // already gone (detached / navigated) — list state is what matters
   }
   pushBreakpoints();
+  void persistSessionBreakpoints();
 }
 
 async function setXhrBreakpoint(url: string) {
@@ -329,6 +415,7 @@ async function setXhrBreakpoint(url: string) {
     await sendCdp("DOMDebugger.setXHRBreakpoint", { url });
     xhrBreakpoints.add(url);
     pushBreakpoints();
+    void persistSessionBreakpoints();
   } catch (e) {
     post({
       type: "breakpoint-error",
@@ -345,6 +432,148 @@ async function removeXhrBreakpoint(url: string) {
     // already gone
   }
   pushBreakpoints();
+  void persistSessionBreakpoints();
+}
+
+// ---- M7: per-origin breakpoint persistence & re-arm ----
+// Line/XHR/GraphQL-op breakpoint DEFINITIONS survive the session so "Reload &
+// capture" (and auto-capture) can arm them before the app bootstraps. Event
+// and function-call breakpoints are not persisted — the latter bind to live
+// function objects that don't survive a load.
+
+async function readPersistedStore(): Promise<Record<string, PersistedBreakpoints>> {
+  const stored = await chrome.storage.local.get(PERSISTED_BP_KEY);
+  return (stored[PERSISTED_BP_KEY] ?? {}) as Record<string, PersistedBreakpoints>;
+}
+
+/** Snapshot the current session's re-armable breakpoints into storage. */
+async function persistSessionBreakpoints() {
+  if (rearming) return; // re-arm is *reading* the store; don't overwrite mid-loop
+  const origin = await getTabOrigin();
+  if (!origin) return;
+  try {
+    const store = await readPersistedStore();
+    store[origin] = {
+      lines: [...breakpoints.values()].map((b) => ({
+        url: b.url,
+        lineNumber: b.lineNumber,
+        columnNumber: b.columnNumber,
+        originalLabel: b.originalLabel,
+        tag: b.tag,
+      })),
+      xhr: [...xhrBreakpoints],
+      gqlOps: [...gqlOpBreakpoints.values()],
+    };
+    await chrome.storage.local.set({ [PERSISTED_BP_KEY]: store });
+  } catch {
+    // persistence is best-effort; the live session state is authoritative
+  }
+}
+
+/** Arm everything persisted for this origin that isn't already armed. */
+async function rearmPersistedBreakpoints() {
+  const origin = await getTabOrigin();
+  if (!origin) return;
+  let persisted: PersistedBreakpoints | undefined;
+  try {
+    persisted = (await readPersistedStore())[origin];
+  } catch {
+    return;
+  }
+  if (!persisted) return;
+  rearming = true;
+  try {
+    const armedLines = new Set(
+      [...breakpoints.values()].map((b) => `${b.url}\n${b.lineNumber}\n${b.columnNumber ?? ""}`),
+    );
+    for (const line of persisted.lines ?? []) {
+      const key = `${line.url}\n${line.lineNumber}\n${line.columnNumber ?? ""}`;
+      if (!armedLines.has(key)) await setBreakpoint(line);
+    }
+    for (const url of persisted.xhr ?? []) {
+      if (!xhrBreakpoints.has(url)) await setXhrBreakpoint(url);
+    }
+    let gqlChanged = false;
+    for (const op of persisted.gqlOps ?? []) {
+      if (!gqlOpBreakpoints.has(op.target)) {
+        gqlOpBreakpoints.set(op.target, op);
+        gqlChanged = true;
+      }
+    }
+    if (gqlChanged) {
+      pushBreakpoints();
+      await syncGqlHook();
+    }
+  } finally {
+    rearming = false;
+  }
+}
+
+/**
+ * M7 "Reload & capture": guarantee the debugger is armed BEFORE the app
+ * bootstraps. Attach if needed (attach already enables all domains, applies
+ * async depth + blackbox), re-arm persisted breakpoints, install in-page
+ * hooks, then reload — so capture starts from the very first request and
+ * pre-load breakpoints sit pending until their scripts parse.
+ */
+async function reloadAndCapture() {
+  try {
+    if (attachedTabId === null) {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab?.id === undefined) {
+        pushStatus("No active tab to attach to");
+        return;
+      }
+      await attach(tab.id);
+      if (attachedTabId === null) return; // attach failed; status already pushed
+    }
+    await rearmPersistedBreakpoints();
+    await syncGqlHook(); // (re)registers the new-document GraphQL hook
+    clearRequests();
+    alreadyLoaded = false;
+    pushStatus();
+    await sendCdp("Page.reload", { ignoreCache: false });
+  } catch (e) {
+    pushStatus(e instanceof Error ? e.message : String(e));
+  }
+}
+
+async function setAutoCapture(enabled: boolean) {
+  autoCapture = enabled;
+  const origin = await getTabOrigin();
+  if (origin) {
+    try {
+      const stored = await chrome.storage.local.get(CAPTURE_KEY);
+      const byOrigin = (stored[CAPTURE_KEY] ?? {}) as Record<string, { autoCapture?: boolean }>;
+      byOrigin[origin] = { autoCapture: enabled };
+      await chrome.storage.local.set({ [CAPTURE_KEY]: byOrigin });
+    } catch {
+      // toggle still applies for this session
+    }
+  }
+  if (enabled && attachedTabId !== null) {
+    await rearmPersistedBreakpoints();
+    await syncGqlHook();
+  }
+  pushStatus();
+}
+
+async function setAsyncDepth(maxDepth: number) {
+  if (!Number.isInteger(maxDepth) || maxDepth < 1) return;
+  asyncDepth = Math.min(maxDepth, 256);
+  try {
+    await chrome.storage.local.set({ [ASYNC_DEPTH_KEY]: asyncDepth });
+  } catch {
+    // applies for this session regardless
+  }
+  if (attachedTabId !== null) {
+    try {
+      await sendCdp("Debugger.setAsyncCallStackDepth", { maxDepth: asyncDepth });
+    } catch (e) {
+      pushStatus(e instanceof Error ? e.message : String(e));
+    }
+  }
+  pushStatus();
 }
 
 // ---- M6 patch: GraphQL operation-scoped breakpoints (see gqlHook.ts) ----
@@ -391,12 +620,14 @@ async function syncGqlHook() {
 async function setGqlOpBreakpoint(target: string, label: string) {
   gqlOpBreakpoints.set(target, { target, label });
   pushBreakpoints();
+  void persistSessionBreakpoints();
   await syncGqlHook();
 }
 
 async function removeGqlOpBreakpoint(target: string) {
   gqlOpBreakpoints.delete(target);
   pushBreakpoints();
+  void persistSessionBreakpoints();
   await syncGqlHook();
 }
 
@@ -1036,6 +1267,24 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       });
       break;
     }
+    case "Page.frameNavigated": {
+      const p = params as unknown as { frame: { parentId?: string } };
+      if (p.frame.parentId) break; // sub-frames don't reset the session
+      // New document: parsed scripts are per-document, and the "already
+      // loaded" hint no longer applies — we're attached from the first byte.
+      scripts.clear();
+      alreadyLoaded = false;
+      if (autoCapture) {
+        // Auto-capture: re-assert persisted breakpoints and in-page hooks on
+        // every navigation so the user never has to click "Reload & capture".
+        // (In-session CDP breakpoints survive navigation; this covers
+        // definitions persisted from earlier sessions and the GraphQL hook's
+        // target sync.)
+        void rearmPersistedBreakpoints().then(() => syncGqlHook());
+      }
+      pushStatus();
+      break;
+    }
     case "Debugger.scriptParsed": {
       const p = params as unknown as ScriptParsedParams;
       if (p.url) {
@@ -1084,21 +1333,40 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         detail = [...gqlOpBreakpoints.keys()].join(", ") || undefined;
         if (frames.length > 2) frames = frames.slice(2);
       }
+      // M7: flatten async parents into the paused stack, exactly like the M1
+      // initiator stacks — separator rows mark each async boundary. This is
+      // what lets request-triggered discovery walk back to a lifecycle hook
+      // (ngOnInit → service → RxJS → fetch crosses several boundaries). Async
+      // frames carry no scopeChain/callFrameId: not steppable or inspectable,
+      // but breakable via url:line. Note the chain can still break short of
+      // user code — zone.js (Angular) and long RxJS pipelines are the common
+      // causes; the panel shows explicit guidance instead of failing silently.
+      const asyncFrames = flattenStack(p.asyncStackTrace).map((f) => ({
+        functionName: f.functionName,
+        scriptId: "",
+        url: f.url,
+        lineNumber: f.lineNumber,
+        columnNumber: f.columnNumber,
+        scopeChain: [],
+      }));
       pausedState = {
         reason,
         detail,
         hitBreakpoints: p.hitBreakpoints ?? [],
-        callFrames: frames.map((f) => ({
-          functionName: f.functionName,
-          scriptId: f.location.scriptId,
-          url: scripts.get(f.location.scriptId)?.url ?? "",
-          lineNumber: f.location.lineNumber,
-          columnNumber: f.location.columnNumber ?? 0,
-          scopeChain: f.scopeChain.map((s) => ({
-            type: s.type,
-            objectId: s.object.objectId,
+        callFrames: [
+          ...frames.map((f) => ({
+            functionName: f.functionName,
+            scriptId: f.location.scriptId,
+            url: scripts.get(f.location.scriptId)?.url ?? "",
+            lineNumber: f.location.lineNumber,
+            columnNumber: f.location.columnNumber ?? 0,
+            scopeChain: f.scopeChain.map((s) => ({
+              type: s.type,
+              objectId: s.object.objectId,
+            })),
           })),
-        })),
+          ...asyncFrames,
+        ],
       };
       post({ type: "paused", state: pausedState });
       if (gqlFrameId !== undefined) void refineGqlPauseDetail(gqlFrameId);
@@ -1136,6 +1404,15 @@ chrome.runtime.onConnect.addListener((p) => {
         break;
       case "reattach-active-tab":
         void reattachActiveTab();
+        break;
+      case "reload-and-capture":
+        void reloadAndCapture();
+        break;
+      case "set-auto-capture":
+        void setAutoCapture(msg.enabled);
+        break;
+      case "set-async-depth":
+        void setAsyncDepth(msg.maxDepth);
         break;
       case "set-breakpoint":
         void setBreakpoint(msg);
@@ -1225,6 +1502,8 @@ chrome.debugger.onDetach.addListener((source) => {
   if (source.tabId === attachedTabId) {
     attachedTabId = null;
     attachedTabTitle = undefined;
+    alreadyLoaded = false;
+    autoCapture = false;
     clearRequests();
     clearDebugSessionState();
     pushStatus("Detached externally");
@@ -1235,6 +1514,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (tabId === attachedTabId) {
     attachedTabId = null;
     attachedTabTitle = undefined;
+    alreadyLoaded = false;
+    autoCapture = false;
     clearRequests();
     clearDebugSessionState();
     pushStatus();

@@ -56,6 +56,9 @@ export interface BreakpointInfo {
   columnNumber?: number;
   originalLabel?: string; // e.g. "src/UserCard.tsx:34" when set via source map
   bound: boolean; // false = pending (script not loaded / no location matched yet)
+  // M7: how the breakpoint was created — "lifecycle" ones get a distinct badge
+  // and a bulk-clear action in the panel.
+  tag?: string;
 }
 
 export interface PausedScope {
@@ -64,12 +67,12 @@ export interface PausedScope {
 }
 
 export interface PausedFrame {
-  functionName: string;
-  scriptId: string;
+  functionName: string; // "[async: …]" rows are separator frames (M7)
+  scriptId: string; // "" for async parent frames (not steppable/inspectable)
   url: string; // resolved from scriptId worker-side; "" if unknown
   lineNumber: number; // 0-based
   columnNumber: number;
-  scopeChain: PausedScope[];
+  scopeChain: PausedScope[]; // empty for async parent frames
 }
 
 export interface PausedSnapshot {
@@ -166,6 +169,7 @@ export type PanelToBg =
       lineNumber: number; // 0-based generated line
       columnNumber?: number;
       originalLabel?: string;
+      tag?: string; // e.g. "lifecycle" (see BreakpointInfo.tag)
     }
   | { type: "remove-breakpoint"; breakpointId: string }
   | { type: "set-xhr-breakpoint"; url: string } // substring match; "" = all requests
@@ -203,7 +207,11 @@ export type PanelToBg =
       framework: FrameworkId;
       requestToken: number;
     }
-  | { type: "set-blackbox-patterns"; patterns: string[] };
+  | { type: "set-blackbox-patterns"; patterns: string[] }
+  // ---- M7: lifecycle & load-time capture ----
+  | { type: "reload-and-capture" } // re-arm everything, then Page.reload
+  | { type: "set-auto-capture"; enabled: boolean } // persisted per-origin
+  | { type: "set-async-depth"; maxDepth: number }; // persisted globally
 
 export type BgToPanel =
   | {
@@ -212,6 +220,12 @@ export type BgToPanel =
       tabId: number | null;
       tabTitle?: string;
       error?: string;
+      // ---- M7: lifecycle & load-time capture ----
+      // True when we attached to a page that had already finished loading —
+      // its init-time requests fired before we were listening.
+      alreadyLoaded?: boolean;
+      autoCapture?: boolean; // per-origin "auto-capture on reload" toggle
+      asyncDepth?: number; // current Debugger.setAsyncCallStackDepth maxDepth
     }
   | { type: "request-added"; request: CapturedRequest }
   | {
