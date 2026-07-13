@@ -1,4 +1,5 @@
 import type { CapturedRequest } from "../shared/messages";
+import { formatGraphQLForAI } from "../background/graphql";
 import type { ResolvedFrame } from "./sourceMapResolver";
 
 export const DEFAULT_QUESTION =
@@ -42,6 +43,11 @@ export function formatRequestContext(
   if (headers.length > 0) {
     lines.push("Request headers:");
     for (const [name, value] of headers) lines.push(`  ${name}: ${value}`);
+  }
+
+  const graphqlContext = formatGraphQLForAI(request);
+  if (graphqlContext) {
+    lines.push("\n" + graphqlContext);
   }
 
   if (frames.length === 0) {

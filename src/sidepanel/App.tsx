@@ -9,6 +9,7 @@ import {
   type FrameworkId,
   type FrameworkResolution,
   type FunctionBreakpointInfo,
+  type GraphQLOperation,
   type PanelToBg,
   type PausedSnapshot,
   type PickedElement,
@@ -16,6 +17,7 @@ import {
   type ScreenshotMode,
   type ScriptInfo,
 } from "../shared/messages";
+import { deriveGraphQLDisplay } from "../background/graphql";
 import {
   clearAllCaches,
   clearRequestCache,
@@ -60,6 +62,35 @@ const METHOD_BADGE: Record<string, string> = {
   PATCH: "bg-amber-100 text-amber-800",
   DELETE: "bg-red-100 text-red-800",
 };
+
+function operationTypeBadgeClass(type?: GraphQLOperation["operationType"]): string {
+  switch (type) {
+    case "mutation":
+      return "bg-rose-100 text-rose-800";
+    case "subscription":
+      return "bg-violet-100 text-violet-800";
+    default:
+      return "bg-sky-100 text-sky-800";
+  }
+}
+
+function GraphQLBadge({ type }: { type?: GraphQLOperation["operationType"] }) {
+  return (
+    <span
+      className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold uppercase ${operationTypeBadgeClass(type)}`}
+    >
+      GQL
+    </span>
+  );
+}
+
+function formatVariables(variables: unknown): string {
+  try {
+    return JSON.stringify(variables, null, 2);
+  } catch {
+    return String(variables);
+  }
+}
 
 function FrameRow({
   frame,
@@ -202,6 +233,7 @@ export default function App() {
                     ...r,
                     status: msg.status ?? r.status,
                     mimeType: msg.mimeType ?? r.mimeType,
+                    graphql: msg.graphql ?? r.graphql,
                   }
                 : r,
             ),
@@ -769,30 +801,50 @@ export default function App() {
           {requests.length === 0 && (
             <li className="p-3 text-gray-500">No requests captured yet.</li>
           )}
-          {requests.map((r) => (
-            <li key={r.requestId}>
-              <button
-                className={`flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-gray-50 ${
-                  r.requestId === selectedId ? "bg-blue-50" : ""
-                }`}
-                onClick={() => setSelectedId(r.requestId)}
-              >
-                <span
-                  className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold ${
-                    METHOD_BADGE[r.method] ?? "bg-gray-100 text-gray-800"
+          {requests.map((r) => {
+            const isGraphQL = !!r.graphql;
+            const firstType = r.graphql?.operations[0]?.operationType;
+            const displayLabel = isGraphQL ? deriveGraphQLDisplay(r.graphql!) : r.url;
+            return (
+              <li key={r.requestId}>
+                <button
+                  className={`flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-gray-50 ${
+                    r.requestId === selectedId ? "bg-blue-50" : ""
                   }`}
+                  onClick={() => setSelectedId(r.requestId)}
                 >
-                  {r.method}
-                </span>
-                <span className="min-w-0 flex-1 truncate" title={r.url}>
-                  {r.url}
-                </span>
-                <span className="shrink-0 text-xs text-gray-500">
-                  {r.status ?? "…"}
-                </span>
-              </button>
-            </li>
-          ))}
+                  <span
+                    className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold ${
+                      METHOD_BADGE[r.method] ?? "bg-gray-100 text-gray-800"
+                    }`}
+                  >
+                    {r.method}
+                  </span>
+                  {isGraphQL && <GraphQLBadge type={firstType} />}
+                  <span
+                    className={`min-w-0 flex-1 truncate ${
+                      isGraphQL ? "" : "url-cell"
+                    }`}
+                    title={isGraphQL ? r.url : undefined}
+                  >
+                    {isGraphQL ? (
+                      <span className="font-medium">{displayLabel}</span>
+                    ) : (
+                      <bdi>{r.url}</bdi>
+                    )}
+                    {isGraphQL && (
+                      <span className="ml-2 text-xs text-gray-400">
+                        <bdi>{r.url}</bdi>
+                      </span>
+                    )}
+                  </span>
+                  <span className="shrink-0 text-xs text-gray-500">
+                    {r.status ?? "…"}
+                  </span>
+                </button>
+              </li>
+            );
+          })}
         </ul>
 
         <section className="h-2/5 shrink-0 overflow-y-auto border-t border-gray-300 bg-gray-50 p-3">
@@ -823,6 +875,69 @@ export default function App() {
                 {selected.type ?? "unknown"}
                 {selected.mimeType ? ` · ${selected.mimeType}` : ""}
               </p>
+
+              {selected.graphql && (
+                <div className="mt-3 rounded border border-indigo-100 bg-indigo-50/60 p-2">
+                  <div className="flex items-center gap-2">
+                    <GraphQLBadge
+                      type={selected.graphql.operations[0]?.operationType}
+                    />
+                    <span className="font-semibold text-indigo-900">
+                      {selected.graphql.isBatch
+                        ? `GraphQL batch (${selected.graphql.operations.length} operations)`
+                        : "GraphQL operation"}
+                    </span>
+                  </div>
+                  <ul className="mt-2 space-y-2">
+                    {selected.graphql.operations.map((op, idx) => (
+                      <li
+                        key={idx}
+                        className="rounded border border-indigo-100 bg-white p-2"
+                      >
+                        <p className="text-sm font-medium text-gray-900">
+                          <span
+                            className={`mr-1 rounded px-1 py-px text-[10px] font-bold uppercase ${operationTypeBadgeClass(op.operationType)}`}
+                          >
+                            {op.operationType}
+                          </span>
+                          {op.operationName ?? "(unnamed)"}
+                          {op.isAnonymous && (
+                            <span className="ml-1 text-xs text-gray-500">
+                              (anonymous)
+                            </span>
+                          )}
+                          {op.isPersisted && (
+                            <span className="ml-1 text-xs text-amber-600">
+                              [persisted]
+                            </span>
+                          )}
+                        </p>
+                        {op.query && (
+                          <details className="mt-1">
+                            <summary className="cursor-pointer text-xs text-gray-600 hover:text-gray-900">
+                              Query
+                            </summary>
+                            <pre className="mt-1 max-h-40 overflow-auto rounded bg-gray-100 p-2 text-xs">
+                              <code>{op.query}</code>
+                            </pre>
+                          </details>
+                        )}
+                        {op.variables !== undefined && (
+                          <details className="mt-1">
+                            <summary className="cursor-pointer text-xs text-gray-600 hover:text-gray-900">
+                              Variables
+                            </summary>
+                            <pre className="mt-1 max-h-40 overflow-auto rounded bg-gray-100 p-2 text-xs">
+                              <code>{formatVariables(op.variables)}</code>
+                            </pre>
+                          </details>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
               <h2 className="mt-3 font-semibold">
                 Initiator stack{" "}
                 <span className="font-normal text-gray-500">

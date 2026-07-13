@@ -18,6 +18,26 @@ export interface CapturedRequest {
   headers?: Record<string, string>; // request headers (M3: AI context)
   initiatorType: string;
   initiatorStack: CallFrame[]; // empty array if none
+  // ---- M6: GraphQL-aware request identification ----
+  graphql?: GraphQLMeta;
+}
+
+// ---- M6: GraphQL operation metadata ----
+
+export interface GraphQLOperation {
+  operationName: string | null; // explicit or derived
+  operationType: "query" | "mutation" | "subscription";
+  isAnonymous: boolean;
+  isPersisted: boolean;
+  // Full text for the detail pane (omitted/trimmed when very large).
+  query?: string;
+  variables?: unknown;
+}
+
+export interface GraphQLMeta {
+  isGraphQL: true;
+  operations: GraphQLOperation[]; // 1 normally, >1 for batched requests
+  isBatch: boolean;
 }
 
 // ---- M4: breakpoints & pause inspection ----
@@ -183,7 +203,13 @@ export type BgToPanel =
       error?: string;
     }
   | { type: "request-added"; request: CapturedRequest }
-  | { type: "request-updated"; requestId: string; status?: number; mimeType?: string }
+  | {
+      type: "request-updated";
+      requestId: string;
+      status?: number;
+      mimeType?: string;
+      graphql?: GraphQLMeta;
+    }
   | { type: "requests-cleared" }
   | { type: "requests-snapshot"; requests: CapturedRequest[] }
   | {

@@ -1,1 +1,21 @@
 @import "tailwindcss";
+
+/* URL cell in the request list: clip from the start so the endpoint tail
+   (path, IDs, query params) stays visible. RTL on the outer element puts the
+   ellipsis on the left; the inner <bdi> keeps the URL characters in correct
+   left-to-right order. */
+.url-cell {
+  display: block;
+  min-width: 0;
+  flex: 1 1 0%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+}
+
+.url-cell > bdi {
+  direction: ltr;
+  unicode-bidi: plaintext;
+}

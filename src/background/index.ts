@@ -9,6 +9,7 @@ import {
   type FrameworkId,
   type FrameworkResolution,
   type FunctionBreakpointInfo,
+  type GraphQLMeta,
   type ListenerInfo,
   type PanelToBg,
   type PausedSnapshot,
@@ -18,6 +19,12 @@ import {
   type ScriptInfo,
 } from "../shared/messages";
 import { pickerScript } from "../content/picker";
+import {
+  getGraphQLBody,
+  isGraphQLCandidate,
+  nullGraphQLMeta,
+  parseGraphQLBody,
+} from "./graphql";
 
 // ---- Minimal shapes for the CDP events/results we consume (protocol 1.3) ----
 
@@ -36,7 +43,13 @@ interface Initiator {
 
 interface RequestWillBeSentParams {
   requestId: string;
-  request: { url: string; method: string; headers: Record<string, string> };
+  request: {
+    url: string;
+    method: string;
+    headers: Record<string, string>;
+    postData?: string;
+    hasPostData?: boolean;
+  };
   timestamp: number;
   type?: string;
   initiator?: Initiator;
@@ -861,6 +874,39 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       };
       requests.set(request.requestId, request);
       post({ type: "request-added", request });
+
+      // M6: GraphQL candidate detection / body retrieval. Only candidates run
+      // the fetch/parse path; non-GraphQL requests are never slowed down.
+      const candidateTabId = source.tabId;
+      if (isGraphQLCandidate(request.method, request.url, request.headers) && candidateTabId !== undefined) {
+        void (async () => {
+          const bodyResult = await getGraphQLBody(
+            candidateTabId,
+            request.requestId,
+            p.request.postData,
+            p.request.hasPostData,
+          );
+          let meta: GraphQLMeta | null;
+          if (bodyResult === null) {
+            // Body unreachable; still flag it so the shared endpoint doesn't
+            // dominate the list with identical URLs.
+            meta = nullGraphQLMeta();
+          } else {
+            meta = parseGraphQLBody(bodyResult.body);
+          }
+          if (meta) {
+            const stored = requests.get(request.requestId);
+            if (stored) {
+              stored.graphql = meta;
+              post({
+                type: "request-updated",
+                requestId: request.requestId,
+                graphql: meta,
+              });
+            }
+          }
+        })();
+      }
       break;
     }
     case "Network.responseReceived": {
