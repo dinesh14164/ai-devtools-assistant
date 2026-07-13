@@ -9,6 +9,7 @@ import {
   type FrameworkId,
   type FrameworkResolution,
   type FunctionBreakpointInfo,
+  type GqlOpBreakpointInfo,
   type GraphQLMeta,
   type ListenerInfo,
   type PanelToBg,
@@ -19,6 +20,7 @@ import {
   type ScriptInfo,
 } from "../shared/messages";
 import { pickerScript } from "../content/picker";
+import { buildGqlHookSource, GQL_PAUSE_SENTINEL } from "./gqlHook";
 import {
   getGraphQLBody,
   isGraphQLCandidate,
@@ -79,6 +81,7 @@ interface PausedParams {
   data?: { url?: string; breakpointURL?: string; eventName?: string };
   hitBreakpoints?: string[];
   callFrames: {
+    callFrameId?: string;
     functionName: string;
     location: { scriptId: string; lineNumber: number; columnNumber?: number };
     scopeChain: { type: string; object: RemoteObject }[];
@@ -115,6 +118,11 @@ const breakpoints = new Map<string, BreakpointInfo>();
 const xhrBreakpoints = new Set<string>();
 const eventBreakpoints = new Map<string, EventBreakpointInfo>(); // eventName -> info
 const functionBreakpoints = new Map<string, FunctionBreakpointInfo>(); // breakpointId -> info
+const gqlOpBreakpoints = new Map<string, GqlOpBreakpointInfo>(); // target -> info
+// Registration id of the new-document hook script; the live-patch flag tells
+// teardown whether the current page needs its fetch/XHR restored.
+let gqlHookScriptId: string | null = null;
+let gqlHookInstalled = false;
 const scripts = new Map<string, ScriptInfo>(); // scriptId -> info
 let pausedState: PausedSnapshot | null = null;
 
@@ -139,6 +147,7 @@ function pushBreakpoints() {
     xhrBreakpoints: [...xhrBreakpoints],
     eventBreakpoints: [...eventBreakpoints.values()],
     functionBreakpoints: [...functionBreakpoints.values()],
+    gqlOpBreakpoints: [...gqlOpBreakpoints.values()],
   });
 }
 
@@ -190,6 +199,12 @@ function clearDebugSessionState() {
   xhrBreakpoints.clear();
   eventBreakpoints.clear();
   functionBreakpoints.clear();
+  // The new-document script and armed targets die with the CDP session; the
+  // live fetch/XHR patch is restored (best-effort) by teardownGqlHookInPage
+  // before a voluntary detach, or by the next page reload otherwise.
+  gqlOpBreakpoints.clear();
+  gqlHookScriptId = null;
+  gqlHookInstalled = false;
   scripts.clear();
   if (pausedState) {
     pausedState = null;
@@ -230,6 +245,7 @@ async function attach(tabId: number) {
 
 async function detach() {
   if (attachedTabId === null) return;
+  await teardownGqlHookInPage(); // needs the live attachment; must run first
   const tabId = attachedTabId;
   attachedTabId = null;
   attachedTabTitle = undefined;
@@ -329,6 +345,103 @@ async function removeXhrBreakpoint(url: string) {
     // already gone
   }
   pushBreakpoints();
+}
+
+// ---- M6 patch: GraphQL operation-scoped breakpoints (see gqlHook.ts) ----
+
+/**
+ * Reconcile the in-page hook with the armed target set, two ways:
+ * - re-register the Page.addScriptToEvaluateOnNewDocument script with the
+ *   targets baked in, so a reload installs the hook (already armed) before any
+ *   page script can capture window.fetch;
+ * - Runtime.evaluate the same source immediately so the current page is
+ *   patched live (works for clients that call window.fetch at request time).
+ */
+async function syncGqlHook() {
+  const targets = [...gqlOpBreakpoints.keys()];
+  try {
+    if (gqlHookScriptId !== null) {
+      const identifier = gqlHookScriptId;
+      gqlHookScriptId = null;
+      await sendCdp("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+    }
+    if (targets.length > 0) {
+      const { identifier } = await sendCdp<{ identifier: string }>(
+        "Page.addScriptToEvaluateOnNewDocument",
+        { source: buildGqlHookSource(targets) },
+      );
+      gqlHookScriptId = identifier;
+      await sendCdp("Runtime.evaluate", { expression: buildGqlHookSource(targets) });
+      gqlHookInstalled = true;
+    } else if (gqlHookInstalled) {
+      // Nothing armed: leave the (now inert) wrappers in place, clear targets.
+      await sendCdp("Runtime.evaluate", {
+        expression:
+          "window.__aiDevtoolsGqlHook && window.__aiDevtoolsGqlHook.setTargets([])",
+      });
+    }
+  } catch (e) {
+    post({
+      type: "breakpoint-error",
+      error: `GraphQL operation breakpoint: ${e instanceof Error ? e.message : String(e)}`,
+    });
+  }
+}
+
+async function setGqlOpBreakpoint(target: string, label: string) {
+  gqlOpBreakpoints.set(target, { target, label });
+  pushBreakpoints();
+  await syncGqlHook();
+}
+
+async function removeGqlOpBreakpoint(target: string) {
+  gqlOpBreakpoints.delete(target);
+  pushBreakpoints();
+  await syncGqlHook();
+}
+
+/**
+ * Restore the page's original fetch/XHR before letting go of the tab. The
+ * new-document registration dies with the CDP session automatically, but a
+ * live monkey-patch would outlive us until the next reload.
+ */
+async function teardownGqlHookInPage() {
+  if (!gqlHookInstalled) return;
+  gqlHookInstalled = false;
+  try {
+    // Runtime.evaluate queues while paused — release execution first (the
+    // detach would resume it anyway).
+    if (pausedState !== null) await sendCdp("Debugger.resume");
+    await sendCdp("Runtime.evaluate", {
+      expression:
+        "window.__aiDevtoolsGqlHook && window.__aiDevtoolsGqlHook.uninstall()",
+    });
+  } catch {
+    // best-effort — a reload cleans the page anyway
+  }
+}
+
+/**
+ * The exact matched operation names live in the sentinel frame's `matched`
+ * local; read them while paused and refresh the pause detail (which starts as
+ * the full armed-target list).
+ */
+async function refineGqlPauseDetail(callFrameId: string) {
+  const state = pausedState;
+  if (!state) return;
+  try {
+    const res = await sendCdp<{ result: RemoteObject }>(
+      "Debugger.evaluateOnCallFrame",
+      { callFrameId, expression: "matched.join(', ')", returnByValue: true },
+    );
+    const names = typeof res.result?.value === "string" ? res.result.value : "";
+    if (names && pausedState === state) {
+      state.detail = names;
+      post({ type: "paused", state });
+    }
+  } catch {
+    // keep the armed-target fallback detail
+  }
 }
 
 // ---- M4 patch: interaction breakpoints ----
@@ -955,11 +1068,27 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
           void removeEventBreakpoint(eventName);
         }
       }
+      let reason = p.reason;
+      let detail = p.data?.eventName ?? p.data?.url ?? p.data?.breakpointURL;
+      let frames = p.callFrames;
+      // The in-page GraphQL hook pauses via a `debugger;` statement (reason
+      // "other") inside a sentinel-named helper. Relabel the pause and drop
+      // the helper + wrapper frames so the stack starts at the app code that
+      // issued the operation.
+      const gqlFrameId =
+        reason === "other" && frames[0]?.functionName === GQL_PAUSE_SENTINEL
+          ? frames[0].callFrameId
+          : undefined;
+      if (gqlFrameId !== undefined) {
+        reason = "GraphQLOperation";
+        detail = [...gqlOpBreakpoints.keys()].join(", ") || undefined;
+        if (frames.length > 2) frames = frames.slice(2);
+      }
       pausedState = {
-        reason: p.reason,
-        detail: p.data?.eventName ?? p.data?.url ?? p.data?.breakpointURL,
+        reason,
+        detail,
         hitBreakpoints: p.hitBreakpoints ?? [],
-        callFrames: p.callFrames.map((f) => ({
+        callFrames: frames.map((f) => ({
           functionName: f.functionName,
           scriptId: f.location.scriptId,
           url: scripts.get(f.location.scriptId)?.url ?? "",
@@ -972,6 +1101,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         })),
       };
       post({ type: "paused", state: pausedState });
+      if (gqlFrameId !== undefined) void refineGqlPauseDetail(gqlFrameId);
       break;
     }
     case "Debugger.resumed": {
@@ -1018,6 +1148,12 @@ chrome.runtime.onConnect.addListener((p) => {
         break;
       case "remove-xhr-breakpoint":
         void removeXhrBreakpoint(msg.url);
+        break;
+      case "set-gql-op-breakpoint":
+        void setGqlOpBreakpoint(msg.target, msg.label);
+        break;
+      case "remove-gql-op-breakpoint":
+        void removeGqlOpBreakpoint(msg.target);
         break;
       case "resume":
         void debuggerCommand("Debugger.resume");

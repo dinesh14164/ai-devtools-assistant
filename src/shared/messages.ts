@@ -40,6 +40,13 @@ export interface GraphQLMeta {
   isBatch: boolean;
 }
 
+// ---- M6 patch: GraphQL operation-scoped breakpoints ----
+
+export interface GqlOpBreakpointInfo {
+  target: string; // operation name matched by the in-page hook (or "persisted:<hash8>")
+  label: string; // display label, e.g. "mutation SaveUser"
+}
+
 // ---- M4: breakpoints & pause inspection ----
 
 export interface BreakpointInfo {
@@ -66,8 +73,10 @@ export interface PausedFrame {
 }
 
 export interface PausedSnapshot {
-  reason: string; // "other" for line breakpoints, "XHR" for XHR breakpoints, ...
-  detail?: string; // e.g. the matching URL for XHR pauses
+  // "other" for line breakpoints, "XHR" for XHR breakpoints, ... Synthesized
+  // worker-side: "GraphQLOperation" for the in-page GraphQL hook's pauses.
+  reason: string;
+  detail?: string; // e.g. the matching URL for XHR pauses, op names for GraphQL
   hitBreakpoints: string[];
   callFrames: PausedFrame[];
 }
@@ -161,6 +170,8 @@ export type PanelToBg =
   | { type: "remove-breakpoint"; breakpointId: string }
   | { type: "set-xhr-breakpoint"; url: string } // substring match; "" = all requests
   | { type: "remove-xhr-breakpoint"; url: string }
+  | { type: "set-gql-op-breakpoint"; target: string; label: string }
+  | { type: "remove-gql-op-breakpoint"; target: string }
   | { type: "resume" }
   | { type: "step-over" }
   | { type: "step-into" }
@@ -218,6 +229,7 @@ export type BgToPanel =
       xhrBreakpoints: string[];
       eventBreakpoints: EventBreakpointInfo[];
       functionBreakpoints: FunctionBreakpointInfo[];
+      gqlOpBreakpoints: GqlOpBreakpointInfo[];
     }
   | { type: "breakpoint-error"; error: string }
   | { type: "paused"; state: PausedSnapshot }

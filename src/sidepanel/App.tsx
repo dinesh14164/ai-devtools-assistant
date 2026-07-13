@@ -9,6 +9,7 @@ import {
   type FrameworkId,
   type FrameworkResolution,
   type FunctionBreakpointInfo,
+  type GqlOpBreakpointInfo,
   type GraphQLOperation,
   type PanelToBg,
   type PausedSnapshot,
@@ -17,7 +18,7 @@ import {
   type ScreenshotMode,
   type ScriptInfo,
 } from "../shared/messages";
-import { deriveGraphQLDisplay } from "../background/graphql";
+import { deriveGraphQLDisplay, getOperationArmTarget } from "../background/graphql";
 import {
   clearAllCaches,
   clearRequestCache,
@@ -170,6 +171,7 @@ export default function App() {
   const [functionBreakpoints, setFunctionBreakpoints] = useState<
     FunctionBreakpointInfo[]
   >([]);
+  const [gqlOpBreakpoints, setGqlOpBreakpoints] = useState<GqlOpBreakpointInfo[]>([]);
   const [handlerCandidates, setHandlerCandidates] =
     useState<HandlerCandidates | null>(null);
   const [framework, setFramework] = useState<FrameworkResolution | null>(null);
@@ -252,6 +254,7 @@ export default function App() {
           setXhrBreakpoints(msg.xhrBreakpoints);
           setEventBreakpoints(msg.eventBreakpoints);
           setFunctionBreakpoints(msg.functionBreakpoints);
+          setGqlOpBreakpoints(msg.gqlOpBreakpoints);
           break;
         case "breakpoint-error":
           setBreakpointError(msg.error);
@@ -612,6 +615,17 @@ export default function App() {
     setView("debug");
   };
 
+  const breakOnGraphQLOperation = (op: GraphQLOperation) => {
+    const target = getOperationArmTarget(op);
+    if (!target) return;
+    send({
+      type: "set-gql-op-breakpoint",
+      target,
+      label: `${op.operationType} ${target}`,
+    });
+    setView("debug");
+  };
+
   const breakOnSelectedUrl = () => {
     if (!selected) return;
     let substring: string;
@@ -861,13 +875,18 @@ export default function App() {
                   >
                     Ask AI about this request
                   </button>
-                  <button
-                    className="rounded bg-gray-200 px-2 py-1 text-xs font-medium text-gray-800 hover:bg-gray-300"
-                    title="Pause execution when a request with this URL fires"
-                    onClick={breakOnSelectedUrl}
-                  >
-                    Break when this URL fires
-                  </button>
+                  {/* For GraphQL the URL is a shared endpoint — a URL breakpoint
+                      would pause on every operation, so the break actions move
+                      into the per-operation cards below. */}
+                  {!selected.graphql && (
+                    <button
+                      className="rounded bg-gray-200 px-2 py-1 text-xs font-medium text-gray-800 hover:bg-gray-300"
+                      title="Pause execution when a request with this URL fires"
+                      onClick={breakOnSelectedUrl}
+                    >
+                      Break when this URL fires
+                    </button>
+                  )}
                 </div>
               </div>
               <p className="mt-1 text-gray-600">
@@ -889,7 +908,9 @@ export default function App() {
                     </span>
                   </div>
                   <ul className="mt-2 space-y-2">
-                    {selected.graphql.operations.map((op, idx) => (
+                    {selected.graphql.operations.map((op, idx) => {
+                      const armTarget = getOperationArmTarget(op);
+                      return (
                       <li
                         key={idx}
                         className="rounded border border-indigo-100 bg-white p-2"
@@ -932,9 +953,27 @@ export default function App() {
                             </pre>
                           </details>
                         )}
+                        {armTarget && (
+                          <button
+                            className="mt-1.5 rounded bg-indigo-600 px-2 py-1 text-xs font-medium text-white hover:bg-indigo-700"
+                            title={`Pause when the ${op.operationType} "${armTarget}" is sent — other operations to this endpoint won't pause`}
+                            onClick={() => breakOnGraphQLOperation(op)}
+                          >
+                            ⏸ Break when operation{" "}
+                            <span className="font-mono">{armTarget}</span> fires
+                          </button>
+                        )}
                       </li>
-                    ))}
+                      );
+                    })}
                   </ul>
+                  <button
+                    className="mt-2 rounded bg-gray-100 px-2 py-0.5 text-[11px] text-gray-600 hover:bg-gray-200"
+                    title="URL-substring breakpoint (DOMDebugger.setXHRBreakpoint) — pauses on EVERY GraphQL operation sent to this endpoint, not just the one above"
+                    onClick={breakOnSelectedUrl}
+                  >
+                    Break on ALL operations to this endpoint
+                  </button>
                 </div>
               )}
 
@@ -975,6 +1014,7 @@ export default function App() {
           xhrBreakpoints={xhrBreakpoints}
           eventBreakpoints={eventBreakpoints}
           functionBreakpoints={functionBreakpoints}
+          gqlOpBreakpoints={gqlOpBreakpoints}
           handlerCandidates={handlerCandidates}
           framework={framework}
           askFramework={askFramework}

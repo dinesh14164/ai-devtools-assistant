@@ -12,6 +12,7 @@ The tool is **provider-agnostic**: you connect any OpenAI-compatible model (Kimi
 - **Breakpoints in minified code** — set a breakpoint on an original source location; the tool reverse-maps it through source maps to the shipped bundle. Inspect the paused call stack, scope, and variables.
 - **Framework-aware handler breakpoints** — pick a button (or any element) and the tool finds the *real* handler behind React/Angular/Vue event delegation and breaks inside it — not in framework internals.
 - **XHR / event breakpoints** — pause when a request matching a URL fires, or on a specific element's handler.
+- **GraphQL operation-scoped breakpoints** — GraphQL operations share one endpoint, so URL breakpoints pause on everything; instead, arm "Break when operation `GetUser` fires" and only that operation pauses (main-world fetch/XHR instrumentation with a conditional `debugger;`). Batched and persisted queries supported.
 - **AI explanations** — send any captured context (request, paused state, element, screenshot, source snippet) to your active model and get a plain-language explanation.
 - **Context sources** — screenshots (viewport / full page / element clip), an element picker with computed styles, and a source viewer with pretty-printing.
 
@@ -101,7 +102,9 @@ src/
 ├── shared/         # message contract + shared types (worker <-> panel)
 │   └── messages.ts
 ├── background/     # service worker: chrome.debugger / CDP, session state,
-│   └── index.ts    # framework detection + handler-extraction adapters
+│   ├── index.ts    # framework detection + handler-extraction adapters
+│   ├── graphql.ts  # GraphQL request detection + operation parsing
+│   └── gqlHook.ts  # in-page fetch/XHR hook for operation-scoped breakpoints
 ├── content/        # element picker (injected on demand via executeScript)
 │   └── picker.ts
 └── sidepanel/      # React UI
@@ -126,6 +129,7 @@ src/
 - Framework handler extraction is reliable in dev builds (React best, everywhere); production builds that strip framework debug hooks fall back to broad break-on-click + AI stack identification.
 - Handler (function-call) breakpoints bind to the function *object* — a page reload or hot-reload silently orphans them; re-pick after reloads.
 - Only one debugger client per tab — the native Sources-tab debugger can't run on the same tab while the extension is attached.
+- GraphQL operation breakpoints match **string** request bodies only (FormData/Blob/stream bodies and raw `application/graphql` text are skipped). If a client captured `fetch` before the hook was armed, reload the page once — the pre-load registration then guarantees coverage.
 
 ---
 

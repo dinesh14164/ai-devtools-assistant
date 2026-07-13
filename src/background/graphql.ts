@@ -194,6 +194,20 @@ export function nullGraphQLMeta(): GraphQLMeta {
   };
 }
 
+/**
+ * The name to arm an operation-scoped breakpoint on, or null when the
+ * operation isn't targetable (e.g. the "body unavailable" placeholder). Must
+ * be a name the in-page hook (gqlHook.ts) can derive from the outgoing body:
+ * a plain GraphQL identifier or the "persisted:<hash8>" label.
+ */
+export function getOperationArmTarget(op: GraphQLOperation): string | null {
+  const name = op.operationName;
+  if (!name) return null;
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return name;
+  if (/^persisted:[0-9a-fA-F]+$/.test(name)) return name;
+  return null;
+}
+
 export function deriveGraphQLDisplay(meta: GraphQLMeta): string {
   const ops = meta.operations;
   if (ops.length === 0) return "GraphQL";

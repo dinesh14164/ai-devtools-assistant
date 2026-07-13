@@ -6,6 +6,7 @@ import type {
   FrameworkId,
   FrameworkResolution,
   FunctionBreakpointInfo,
+  GqlOpBreakpointInfo,
   PanelToBg,
   PausedFrame,
   PausedSnapshot,
@@ -35,6 +36,7 @@ interface DebuggerProps {
   xhrBreakpoints: string[];
   eventBreakpoints: EventBreakpointInfo[];
   functionBreakpoints: FunctionBreakpointInfo[];
+  gqlOpBreakpoints: GqlOpBreakpointInfo[];
   handlerCandidates: HandlerCandidates | null;
   framework: FrameworkResolution | null;
   askFramework: boolean;
@@ -204,6 +206,7 @@ export default function Debugger({
   xhrBreakpoints,
   eventBreakpoints,
   functionBreakpoints,
+  gqlOpBreakpoints,
   handlerCandidates,
   framework,
   askFramework,
@@ -281,6 +284,12 @@ export default function Debugger({
       if (paused.reason === "XHR") {
         lines.push(
           `Paused by XHR/fetch breakpoint${paused.detail ? ` matching "${paused.detail}"` : ""}.`,
+        );
+      } else if (paused.reason === "GraphQLOperation") {
+        lines.push(
+          `Paused by a GraphQL operation breakpoint${
+            paused.detail ? ` (operation: ${paused.detail})` : ""
+          } — execution stopped in the app code that issued the GraphQL request (the instrumentation wrapper frames are trimmed from the stack).`,
         );
       } else if (paused.reason === "EventListener") {
         lines.push(
@@ -727,10 +736,38 @@ export default function Debugger({
       </section>
 
       <section>
-        <h2 className="font-semibold">XHR / fetch breakpoints</h2>
-        {xhrBreakpoints.length === 0 && (
+        <h2 className="font-semibold">XHR / fetch / GraphQL breakpoints</h2>
+        {gqlOpBreakpoints.length > 0 && (
+          <>
+            <ul className="mt-1 space-y-1">
+              {gqlOpBreakpoints.map((g) => (
+                <li key={g.target} className="flex items-center gap-2 text-xs">
+                  <span className="shrink-0 rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-semibold text-indigo-700">
+                    GraphQL op
+                  </span>
+                  <span className="min-w-0 flex-1 break-all font-mono">{g.label}</span>
+                  <button
+                    className="shrink-0 rounded bg-red-100 px-2 py-0.5 text-red-700 hover:bg-red-200"
+                    onClick={() =>
+                      send({ type: "remove-gql-op-breakpoint", target: g.target })
+                    }
+                  >
+                    Remove
+                  </button>
+                </li>
+              ))}
+            </ul>
+            <p className="mt-1 text-[11px] text-gray-500">
+              If an armed operation doesn't pause, reload the page — some GraphQL
+              clients capture <code>fetch</code> before the hook was installed;
+              after a reload the hook is guaranteed to be in place first.
+            </p>
+          </>
+        )}
+        {xhrBreakpoints.length === 0 && gqlOpBreakpoints.length === 0 && (
           <p className="mt-1 text-xs text-gray-500">
-            None set. Use "Break when this URL fires" on a request, or add a URL
+            None set. Use "Break when this URL fires" on a request (or "Break
+            when operation … fires" on a GraphQL request), or add a URL
             substring below.
           </p>
         )}
