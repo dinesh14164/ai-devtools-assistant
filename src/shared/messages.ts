@@ -2,7 +2,12 @@ export const PORT_NAME = "ai-devtools-panel";
 
 export interface CallFrame {
   functionName: string;
-  url: string;
+  // CDP's Runtime.CallFrame carries scriptId on every real frame; "" only on
+  // synthetic frames (async separators, parser initiators). Source-map
+  // resolution keys off scriptId — NEVER off url, which may be empty or a
+  // webpack:// pseudo-URL for eval'd Module Federation chunks.
+  scriptId: string;
+  url: string; // display only
   lineNumber: number;
   columnNumber: number;
 }
@@ -68,7 +73,7 @@ export interface PausedScope {
 
 export interface PausedFrame {
   functionName: string; // "[async: …]" rows are separator frames (M7)
-  scriptId: string; // "" for async parent frames (not steppable/inspectable)
+  scriptId: string; // resolution key; "" only on separator rows
   url: string; // resolved from scriptId worker-side; "" if unknown
   lineNumber: number; // 0-based
   columnNumber: number;
@@ -119,7 +124,8 @@ export interface ExtractedHandler {
   handlerObjectId: string; // the REAL handler function (bound fns unwrapped)
   description: string; // function preview
   via: string; // how it was found, e.g. "React onClick prop"
-  url?: string; // generated script URL from [[FunctionLocation]]
+  scriptId?: string; // from [[FunctionLocation]] — the resolution key
+  url?: string; // generated script URL, display only
   lineNumber?: number; // 0-based generated
   columnNumber?: number;
 }
@@ -153,9 +159,43 @@ export type PickerMessage =
 
 export interface ScriptInfo {
   scriptId: string;
-  url: string;
-  hasSourceMap: boolean;
+  url: string; // may be "", or a webpack:// pseudo-URL for eval'd modules
+  // Straight off Debugger.scriptParsed — external URL, relative URL, or an
+  // inline data: URI (webpack eval-source-map). This is the source of truth
+  // for map discovery; the script text is never fetched or regexed.
+  sourceMapURL?: string;
+  hasSourceURL?: boolean; // eval'd scripts named via //# sourceURL=
+  executionContextId?: number;
 }
+
+// ---- Source-map fetch (worker performs it — it owns the debugger; the panel
+// owns SourceMapConsumer + caches). The primary path is CDP
+// Network.loadNetworkResource, which fetches in the PAGE's network context
+// with the page's cookies/credentials — same as DevTools — so maps behind
+// auth resolve. Every failure carries an explicit machine-readable reason so
+// the UI can always answer "why isn't it using the real files?". ----
+
+export type SourceMapFetchResult =
+  | {
+      ok: true;
+      scriptId: string;
+      mapUrl: string; // "(inline data: URI)" for embedded maps
+      inline: boolean;
+      mapJson: string;
+    }
+  | {
+      ok: false;
+      scriptId: string;
+      mapUrl?: string;
+      reason:
+        | "no-map" // scriptParsed had no sourceMapURL
+        | "unresolvable-url" // relative ref with no resolvable base (webpack://)
+        | "mixed-content" // HTTPS page + HTTP non-localhost map (MFE remotes)
+        | "fetch-failed";
+      httpStatus?: number;
+      netError?: string;
+      message: string;
+    };
 
 export type ScreenshotMode = "viewport" | "fullpage" | "clip";
 
@@ -165,7 +205,8 @@ export type PanelToBg =
   | { type: "reattach-active-tab" }
   | {
       type: "set-breakpoint";
-      url: string;
+      url: string; // "" for eval'd/anonymous scripts — scriptId is used instead
+      scriptId?: string; // enables Debugger.setBreakpoint when url is unusable
       lineNumber: number; // 0-based generated line
       columnNumber?: number;
       originalLabel?: string;
@@ -208,6 +249,10 @@ export type PanelToBg =
       requestToken: number;
     }
   | { type: "set-blackbox-patterns"; patterns: string[] }
+  // Source-map fetch through the worker (CDP page-context; see SourceMapFetchResult)
+  | { type: "fetch-source-map"; scriptId: string; requestToken: number }
+  // Original-source fetch (when a map has no sourcesContent) — same page-context path
+  | { type: "fetch-page-resource"; url: string; requestToken: number }
   // ---- M7: lifecycle & load-time capture ----
   | { type: "reload-and-capture" } // re-arm everything, then Page.reload
   | { type: "set-auto-capture"; enabled: boolean } // persisted per-origin
@@ -258,6 +303,11 @@ export type BgToPanel =
   | { type: "element-picked"; payload: PickedElement }
   | { type: "picker-cancelled" }
   | { type: "scripts"; scripts: ScriptInfo[] }
+  // Live registry updates — MFE remote chunks parse long after load (lazy
+  // routes), so the diagnostics list must grow as scriptParsed events arrive.
+  | { type: "script-parsed"; script: ScriptInfo }
+  | { type: "source-map"; requestToken: number; result: SourceMapFetchResult }
+  | { type: "page-resource"; requestToken: number; content?: string; error?: string }
   | { type: "script-source"; requestToken: number; source?: string; error?: string }
   | { type: "framework"; requestToken: number; resolution: FrameworkResolution }
   | {

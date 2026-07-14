@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   PORT_NAME,
   type BgToPanel,
@@ -22,10 +22,15 @@ import { deriveGraphQLDisplay, getOperationArmTarget } from "../background/graph
 import {
   clearAllCaches,
   clearRequestCache,
+  configureWorkerBridge,
+  describeSourceMapStatus,
+  getSourceMapStatuses,
   resolveGeneratedPosition,
   resolveOriginalLocation,
   resolveRequestStack,
+  subscribeSourceMapStatuses,
   type ResolvedFrame,
+  type SourceMapStatus,
 } from "./sourceMapResolver";
 import { getConfig, type ModelConfigState } from "./modelConfig";
 import { DEFAULT_QUESTION, formatRequestContext } from "./requestContext";
@@ -36,7 +41,7 @@ import Debugger, {
   type DisplayHandler,
   type HandlerCandidates,
 } from "./Debugger";
-import SourcesView from "./SourcesView";
+import SourcesView, { type SourcesNavTarget } from "./SourcesView";
 import {
   DEFAULT_QUESTIONS,
   type Attachment,
@@ -98,10 +103,14 @@ function formatVariables(variables: unknown): string {
 
 function FrameRow({
   frame,
+  mapStatus,
   onBreak,
+  onOpenSource,
 }: {
   frame: ResolvedFrame;
+  mapStatus: SourceMapStatus | undefined;
   onBreak: (frame: ResolvedFrame) => void;
+  onOpenSource: (frame: ResolvedFrame) => void;
 }) {
   if (frame.isAsyncSeparator) {
     return (
@@ -112,23 +121,40 @@ function FrameRow({
   }
   const rawLocation = frame.raw.url
     ? `${frame.raw.url}:${frame.raw.lineNumber}:${frame.raw.columnNumber}`
-    : null;
-  const breakButton = frame.raw.url ? (
-    <button
-      className="rounded bg-gray-200 px-1.5 py-px align-middle text-[10px] font-medium text-gray-700 hover:bg-gray-300"
-      title="Set a breakpoint at this frame"
-      onClick={() => onBreak(frame)}
-    >
-      ⏸ break
-    </button>
-  ) : null;
+    : frame.raw.scriptId
+      ? `scriptId ${frame.raw.scriptId}:${frame.raw.lineNumber}:${frame.raw.columnNumber}`
+      : null;
+  // Breakable when the frame identifies a real script — by URL or (eval'd
+  // webpack modules) by scriptId.
+  const breakButton =
+    frame.raw.url || frame.raw.scriptId ? (
+      <button
+        className="rounded bg-gray-200 px-1.5 py-px align-middle text-[10px] font-medium text-gray-700 hover:bg-gray-300"
+        title="Set a breakpoint at this frame"
+        onClick={() => onBreak(frame)}
+      >
+        ⏸ break
+      </button>
+    ) : null;
   if (!frame.resolved) {
+    // Fix 4: never silent — an unmapped frame says why on hover.
+    const reason = !frame.raw.scriptId
+      ? "no script attribution (native/synthetic frame)"
+      : mapStatus?.state === "resolved"
+        ? "map resolved, but this exact position has no original mapping"
+        : describeSourceMapStatus(mapStatus);
     return (
-      <li>
-        <span className="font-mono">{frame.raw.functionName || "(anonymous)"}</span>{" "}
-        {breakButton}{" "}
+      <li className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
+        <span className="font-mono">{frame.raw.functionName || "(anonymous)"}</span>
+        <span
+          className="cursor-help rounded bg-amber-100 px-1 py-px align-middle text-[10px] font-semibold text-amber-700"
+          title={reason}
+        >
+          ⚠ {mapStatus?.state === "no-map" || !frame.raw.scriptId ? "no source map" : "unmapped"}
+        </span>
+        {breakButton}
         {rawLocation && (
-          <span className="break-all font-mono text-xs text-gray-500">
+          <span className="break-all font-mono text-xs text-gray-500" title={reason}>
             {rawLocation}
           </span>
         )}
@@ -136,21 +162,25 @@ function FrameRow({
     );
   }
   return (
-    <li>
+    <li className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
       <span className="font-mono">
         {frame.resolved.name || frame.raw.functionName || "(anonymous)"}
-      </span>{" "}
+      </span>
       <span className="rounded bg-emerald-100 px-1 py-px align-middle text-[10px] font-semibold text-emerald-700">
         mapped
-      </span>{" "}
-      {breakButton}{" "}
-      <span className="break-all font-mono text-xs text-gray-600">
-        {frame.resolved.source}:{frame.resolved.line}:{frame.resolved.column}
       </span>
+      {breakButton}
+      <button
+        className="break-all text-left font-mono text-xs text-blue-700 underline decoration-dotted hover:text-blue-900"
+        title="Open the original file at this line (Sources tab)"
+        onClick={() => onOpenSource(frame)}
+      >
+        {frame.resolved.source}:{frame.resolved.line}:{frame.resolved.column}
+      </button>
       {rawLocation && (
-        <div className="break-all font-mono text-[10px] text-gray-400">
+        <span className="w-full break-all font-mono text-[10px] text-gray-400">
           {rawLocation}
-        </div>
+        </span>
       )}
     </li>
   );
@@ -189,6 +219,14 @@ export default function App() {
   const [pendingPreview, setPendingPreview] = useState<PendingPreview | null>(null);
   const [picking, setPicking] = useState(false);
   const [scripts, setScripts] = useState<ScriptInfo[]>([]);
+  // Per-script source-map statuses (Fix 4) — live view of the resolver's
+  // registry, feeding frame indicators and the diagnostics panel.
+  const mapStatuses = useSyncExternalStore(
+    subscribeSourceMapStatuses,
+    getSourceMapStatuses,
+  );
+  // Pending "open original file at line" navigation for the Sources tab.
+  const [sourcesNav, setSourcesNav] = useState<SourcesNavTarget | null>(null);
   const attachmentIdRef = useRef(0);
   // What the next element pick is for: chat attachment (default) or finding
   // an element's event handlers to break on.
@@ -281,6 +319,8 @@ export default function App() {
         case "properties":
         case "screenshot":
         case "script-source":
+        case "source-map":
+        case "page-resource":
         case "framework":
         case "handler-candidates": {
           const pending = pendingRpcRef.current.get(msg.requestToken);
@@ -302,9 +342,9 @@ export default function App() {
               async (candidates) => {
                 const display: DisplayHandler[] = await Promise.all(
                   candidates.map(async (c) => {
-                    if (!c.url || c.lineNumber === undefined) return c;
+                    if (!c.scriptId || c.lineNumber === undefined) return c;
                     const loc = await resolveOriginalLocation(
-                      c.url,
+                      c.scriptId,
                       c.lineNumber,
                       c.columnNumber ?? 0,
                     );
@@ -344,11 +384,46 @@ export default function App() {
         case "scripts":
           setScripts(msg.scripts);
           break;
+        case "script-parsed":
+          // Live registry growth — lazily-loaded MFE remote chunks parse long
+          // after initial load and must appear in diagnostics as they arrive.
+          setScripts((prev) => {
+            const i = prev.findIndex((s) => s.scriptId === msg.script.scriptId);
+            if (i === -1) return [...prev, msg.script];
+            const next = prev.slice();
+            next[i] = msg.script;
+            return next;
+          });
+          break;
       }
+    });
+    // The resolver fetches maps through the worker (page network context, with
+    // the page's credentials) — hand it this port's RPC.
+    configureWorkerBridge({
+      fetchSourceMap: async (scriptId) => {
+        const msg = (await sendRpc((requestToken) => ({
+          type: "fetch-source-map",
+          scriptId,
+          requestToken,
+        }))) as Extract<BgToPanel, { type: "source-map" }>;
+        return msg.result;
+      },
+      fetchPageResource: async (url) => {
+        const msg = (await sendRpc((requestToken) => ({
+          type: "fetch-page-resource",
+          url,
+          requestToken,
+        }))) as Extract<BgToPanel, { type: "page-resource" }>;
+        if (msg.error || msg.content === undefined) {
+          throw new Error(msg.error ?? "No content");
+        }
+        return msg.content;
+      },
     });
     port.postMessage({ type: "get-status" } satisfies PanelToBg);
     return () => {
       portRef.current = null;
+      configureWorkerBridge(null);
       port.disconnect();
       clearAllCaches();
     };
@@ -373,7 +448,7 @@ export default function App() {
   ) => {
     const locations = await Promise.all(
       state.callFrames.map((f) =>
-        resolveOriginalLocation(f.url, f.lineNumber, f.columnNumber),
+        resolveOriginalLocation(f.scriptId, f.lineNumber, f.columnNumber),
       ),
     );
     const stackLines = state.callFrames.map((f, i) => {
@@ -583,13 +658,14 @@ export default function App() {
   };
 
   const setBreakpointFromFrame = async (frame: ResolvedFrame) => {
-    if (frame.isAsyncSeparator || !frame.raw.url) return;
+    if (frame.isAsyncSeparator || (!frame.raw.url && !frame.raw.scriptId)) return;
     setBreakpointError(null);
     if (frame.resolved) {
       // Reverse source-map direction: exact `source` string from the M2
-      // resolution (never the display label) -> generated position.
+      // resolution (never the display label) -> generated position. Keyed by
+      // scriptId, so eval'd/webpack:// frames work too.
       const gen = await resolveGeneratedPosition(
-        frame.raw.url,
+        frame.raw.scriptId,
         frame.resolved.source,
         frame.resolved.line,
       );
@@ -597,6 +673,7 @@ export default function App() {
         send({
           type: "set-breakpoint",
           url: frame.raw.url,
+          scriptId: frame.raw.scriptId,
           lineNumber: gen.lineNumber,
           columnNumber: gen.columnNumber,
           originalLabel: `${frame.resolved.source}:${frame.resolved.line}`,
@@ -615,10 +692,39 @@ export default function App() {
     send({
       type: "set-breakpoint",
       url: frame.raw.url,
+      scriptId: frame.raw.scriptId,
       lineNumber: frame.raw.lineNumber,
       columnNumber: frame.raw.columnNumber,
     });
     setView("debug");
+  };
+
+  // Fix 6: a clicked resolved frame opens the ORIGINAL file at its line in
+  // the Sources tab (sourcesContent-backed — usually zero extra network).
+  const openOriginalSource = (scriptId: string, source: string, line: number) => {
+    setSourcesNav({ scriptId, source, line, nonce: Date.now() });
+    setView("sources");
+  };
+
+  // Fix 6: breakpoint from an original-source line — reverse-map, then arm.
+  const breakOnOriginalLine = async (
+    script: ScriptInfo,
+    source: string,
+    line: number,
+  ): Promise<string | null> => {
+    const gen = await resolveGeneratedPosition(script.scriptId, source, line);
+    if (!gen) {
+      return `${source}:${line} has no mapping in the shipped bundle (dead code or inlined) — can't arm it.`;
+    }
+    send({
+      type: "set-breakpoint",
+      url: script.url,
+      scriptId: script.scriptId,
+      lineNumber: gen.lineNumber,
+      columnNumber: gen.columnNumber,
+      originalLabel: `${source}:${line}`,
+    });
+    return null;
   };
 
   const breakOnGraphQLOperation = (op: GraphQLOperation) => {
@@ -1038,7 +1144,17 @@ export default function App() {
                     <FrameRow
                       key={i}
                       frame={f}
+                      mapStatus={mapStatuses[f.raw.scriptId]}
                       onBreak={(fr) => void setBreakpointFromFrame(fr)}
+                      onOpenSource={(fr) => {
+                        if (fr.resolved) {
+                          openOriginalSource(
+                            fr.raw.scriptId,
+                            fr.resolved.source,
+                            fr.resolved.line,
+                          );
+                        }
+                      }}
                     />
                   ))}
                 </ol>
@@ -1066,6 +1182,7 @@ export default function App() {
           asyncDepth={status.asyncDepth}
           send={send}
           fetchProperties={fetchProperties}
+          onOpenSource={openOriginalSource}
           onExplain={(text) => {
             setPrefill({ text, nonce: Date.now() });
             setView("chat");
@@ -1099,11 +1216,14 @@ export default function App() {
       <div className={view === "sources" ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
         <SourcesView
           scripts={scripts}
+          statuses={mapStatuses}
+          navigate={sourcesNav}
           refreshScripts={() => send({ type: "get-scripts" })}
           getScriptSource={getScriptSource}
           onAttach={(label, code) =>
             addAttachment({ kind: "source", label, text: code }, DEFAULT_QUESTIONS.source)
           }
+          onBreakOnOriginalLine={breakOnOriginalLine}
         />
       </div>
 

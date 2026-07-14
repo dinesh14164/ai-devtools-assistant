@@ -18,7 +18,9 @@ import {
   type RemoteProperty,
   type ScreenshotMode,
   type ScriptInfo,
+  type SourceMapFetchResult,
 } from "../shared/messages";
+import { decodeDataUri } from "../shared/dataUri";
 import { pickerScript } from "../content/picker";
 import { buildGqlHookSource, GQL_PAUSE_SENTINEL } from "./gqlHook";
 import {
@@ -66,6 +68,18 @@ interface ScriptParsedParams {
   scriptId: string;
   url: string;
   sourceMapURL?: string;
+  hasSourceURL?: boolean;
+  executionContextId?: number;
+}
+
+interface LoadNetworkResourceResult {
+  resource: {
+    success: boolean;
+    netError?: number;
+    netErrorName?: string;
+    httpStatusCode?: number;
+    stream?: string; // IO.StreamHandle
+  };
 }
 
 interface RemoteObject {
@@ -128,6 +142,10 @@ let gqlHookScriptId: string | null = null;
 let gqlHookInstalled = false;
 const scripts = new Map<string, ScriptInfo>(); // scriptId -> info
 let pausedState: PausedSnapshot | null = null;
+// Network.loadNetworkResource needs the frame whose network context (cookies,
+// credentials) the fetch should run in — always the main frame here.
+let mainFrameId: string | null = null;
+let pageUrl: string | undefined; // for mixed-content detection
 
 // ---- M7: lifecycle & load-time capture ----
 // The panel usually attaches AFTER the page loaded, so init-time requests
@@ -197,6 +215,7 @@ function flattenStack(stack?: StackNode): CallFrame[] {
       // synthetic separator frame so the UI can show the async boundary
       frames.push({
         functionName: `[async: ${node.description}]`,
+        scriptId: "",
         url: "",
         lineNumber: 0,
         columnNumber: 0,
@@ -215,6 +234,7 @@ function buildInitiatorFrames(initiator?: Initiator): CallFrame[] {
     return [
       {
         functionName: "(parser)",
+        scriptId: "",
         url: initiator.url,
         lineNumber: initiator.lineNumber ?? 0,
         columnNumber: 0,
@@ -241,6 +261,8 @@ function clearDebugSessionState() {
   gqlHookScriptId = null;
   gqlHookInstalled = false;
   scripts.clear();
+  mainFrameId = null;
+  pageUrl = undefined;
   if (pausedState) {
     pausedState = null;
     post({ type: "resumed" }); // execution is effectively released
@@ -268,6 +290,17 @@ async function attach(tabId: number) {
       maxDepth: asyncDepth,
     });
     attachedTabId = tabId;
+    // Main frame id + URL: needed for page-context resource fetches
+    // (Network.loadNetworkResource) and mixed-content diagnosis.
+    try {
+      const tree = (await chrome.debugger.sendCommand({ tabId }, "Page.getFrameTree")) as {
+        frameTree: { frame: { id: string; url?: string } };
+      };
+      mainFrameId = tree.frameTree.frame.id;
+      pageUrl = tree.frameTree.frame.url;
+    } catch {
+      mainFrameId = null; // loadNetworkResource still works frameless in most Chromes
+    }
     // Blackbox patterns are per-session; re-apply the last set on re-attach.
     if (blackboxPatterns.length > 0) void applyBlackboxPatterns(blackboxPatterns);
     try {
@@ -367,12 +400,36 @@ function sendCdp<T = unknown>(
 
 async function setBreakpoint(msg: {
   url: string;
+  scriptId?: string;
   lineNumber: number;
   columnNumber?: number;
   originalLabel?: string;
   tag?: string;
 }) {
   try {
+    if (!msg.url && msg.scriptId) {
+      // Eval'd/anonymous scripts (webpack eval builds) have no URL that
+      // setBreakpointByUrl could match — bind by scriptId. Dies with the
+      // document (scriptIds are per-load), so it's session-only by nature.
+      const result = await sendCdp<{ breakpointId: string }>("Debugger.setBreakpoint", {
+        location: {
+          scriptId: msg.scriptId,
+          lineNumber: msg.lineNumber,
+          ...(msg.columnNumber !== undefined ? { columnNumber: msg.columnNumber } : {}),
+        },
+      });
+      breakpoints.set(result.breakpointId, {
+        breakpointId: result.breakpointId,
+        url: scripts.get(msg.scriptId)?.url ?? "",
+        lineNumber: msg.lineNumber,
+        columnNumber: msg.columnNumber,
+        originalLabel: msg.originalLabel,
+        tag: msg.tag,
+        bound: true, // setBreakpoint binds immediately or throws
+      });
+      pushBreakpoints();
+      return;
+    }
     const result = await sendCdp<SetBreakpointResult>("Debugger.setBreakpointByUrl", {
       url: msg.url,
       lineNumber: msg.lineNumber,
@@ -454,7 +511,11 @@ async function persistSessionBreakpoints() {
   try {
     const store = await readPersistedStore();
     store[origin] = {
-      lines: [...breakpoints.values()].map((b) => ({
+      // scriptId-bound breakpoints (url "") can't be re-armed across loads —
+      // scriptIds are per-document — so they're not persisted.
+      lines: [...breakpoints.values()]
+        .filter((b) => b.url)
+        .map((b) => ({
         url: b.url,
         lineNumber: b.lineNumber,
         columnNumber: b.columnNumber,
@@ -1005,6 +1066,7 @@ async function extractHandler(
       const resolved = await resolveHandlerFunction(candidate.handlerObjectId);
       candidate.handlerObjectId = resolved.objectId;
       if (resolved.location) {
+        candidate.scriptId = resolved.location.scriptId;
         candidate.url = scripts.get(resolved.location.scriptId)?.url;
         candidate.lineNumber = resolved.location.lineNumber;
         candidate.columnNumber = resolved.location.columnNumber;
@@ -1175,6 +1237,196 @@ async function activatePicker() {
   }
 }
 
+// ---- Source-map fetch, the way DevTools does it (page network context) ----
+
+/** Drain a CDP IO stream (from Network.loadNetworkResource) to a string. */
+async function readCdpStream(handle: string): Promise<string> {
+  let text = "";
+  let base64 = "";
+  try {
+    for (;;) {
+      const chunk = await sendCdp<{ data: string; base64Encoded?: boolean; eof: boolean }>(
+        "IO.read",
+        { handle },
+      );
+      if (chunk.base64Encoded) base64 += chunk.data;
+      else text += chunk.data;
+      if (chunk.eof) break;
+    }
+  } finally {
+    void sendCdp("IO.close", { handle }).catch(() => {});
+  }
+  if (base64) {
+    const binary = atob(base64);
+    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    return text + new TextDecoder().decode(bytes);
+  }
+  return text;
+}
+
+/**
+ * HTTPS container loading an HTTP map is blocked as mixed content — except
+ * localhost/loopback, which browsers treat as potentially trustworthy (the
+ * common MFE dev setup: HTTPS container + http://localhost remote is fine).
+ */
+function isMixedContent(page: string | undefined, resourceUrl: string): boolean {
+  if (!page) return false;
+  try {
+    const p = new URL(page);
+    const r = new URL(resourceUrl);
+    if (p.protocol !== "https:" || r.protocol !== "http:") return false;
+    return !["localhost", "127.0.0.1", "[::1]"].includes(r.hostname);
+  } catch {
+    return false;
+  }
+}
+
+interface PageResourceOutcome {
+  ok: boolean;
+  content?: string;
+  httpStatus?: number;
+  netError?: string;
+}
+
+/**
+ * Fetch a URL in the PAGE's network context via CDP — with the page's
+ * cookies/credentials, exactly like DevTools fetches source maps. This is
+ * what makes maps on authenticated hosts resolve; a panel/extension-origin
+ * fetch() has no page credentials and silently 401s. Falls back to a
+ * credentialed extension fetch only if the CDP command itself is unavailable.
+ */
+async function loadPageResource(url: string): Promise<PageResourceOutcome> {
+  try {
+    const res = await sendCdp<LoadNetworkResourceResult>("Network.loadNetworkResource", {
+      ...(mainFrameId ? { frameId: mainFrameId } : {}),
+      url,
+      options: { disableCache: false, includeCredentials: true },
+    });
+    const r = res.resource;
+    if (r.success && r.stream) {
+      return { ok: true, content: await readCdpStream(r.stream) };
+    }
+    return {
+      ok: false,
+      httpStatus: r.httpStatusCode,
+      netError:
+        r.netErrorName ?? (r.netError !== undefined ? `net error ${r.netError}` : undefined),
+    };
+  } catch {
+    // Command unavailable (old Chrome) or attachment raced away — fall through.
+  }
+  try {
+    const resp = await fetch(url, { credentials: "include" });
+    if (resp.ok) return { ok: true, content: await resp.text() };
+    return { ok: false, httpStatus: resp.status };
+  } catch (e) {
+    return { ok: false, netError: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Resolve a script's source map to raw JSON. Discovery is scriptParsed's
+ * sourceMapURL (per-script — every MFE bundle/remote resolves independently);
+ * inline data: URIs (webpack eval-source-map) decode locally with no network.
+ * Every failure returns an explicit reason — never a silent null.
+ */
+async function fetchSourceMapFor(scriptId: string, requestToken: number) {
+  const reply = (result: SourceMapFetchResult) =>
+    post({ type: "source-map", requestToken, result });
+  const script = scripts.get(scriptId);
+  if (!script) {
+    return reply({
+      ok: false,
+      scriptId,
+      reason: "no-map",
+      message: "Script is no longer in the registry (page navigated?)",
+    });
+  }
+  const ref = script.sourceMapURL;
+  if (!ref) {
+    return reply({
+      ok: false,
+      scriptId,
+      reason: "no-map",
+      message: "Debugger.scriptParsed reported no sourceMapURL for this script",
+    });
+  }
+  if (ref.startsWith("data:")) {
+    const mapUrl = "(inline data: URI)";
+    try {
+      return reply({ ok: true, scriptId, mapUrl, inline: true, mapJson: decodeDataUri(ref) });
+    } catch (e) {
+      return reply({
+        ok: false,
+        scriptId,
+        reason: "fetch-failed",
+        mapUrl,
+        message: `Inline map decode failed: ${e instanceof Error ? e.message : String(e)}`,
+      });
+    }
+  }
+  let mapUrl: string;
+  try {
+    mapUrl = new URL(ref, script.url || undefined).href;
+  } catch {
+    return reply({
+      ok: false,
+      scriptId,
+      reason: "unresolvable-url",
+      message: `Map URL "${ref}" is relative, but the script URL ("${script.url || "(none)"}") is not a resolvable base`,
+    });
+  }
+  if (!/^https?:/.test(mapUrl)) {
+    return reply({
+      ok: false,
+      scriptId,
+      reason: "unresolvable-url",
+      mapUrl,
+      message: `Map URL is not fetchable: ${mapUrl}`,
+    });
+  }
+  const out = await loadPageResource(mapUrl);
+  if (out.ok && out.content !== undefined) {
+    return reply({ ok: true, scriptId, mapUrl, inline: false, mapJson: out.content });
+  }
+  if (isMixedContent(pageUrl, mapUrl)) {
+    return reply({
+      ok: false,
+      scriptId,
+      reason: "mixed-content",
+      mapUrl,
+      httpStatus: out.httpStatus,
+      netError: out.netError,
+      message:
+        "Blocked as mixed content: this HTTPS page can't load an HTTP source map. Serve the remote (or its maps) over HTTPS, or use inline maps in dev.",
+    });
+  }
+  return reply({
+    ok: false,
+    scriptId,
+    reason: "fetch-failed",
+    mapUrl,
+    httpStatus: out.httpStatus,
+    netError: out.netError,
+    message: out.httpStatus
+      ? `Map fetch failed: HTTP ${out.httpStatus}`
+      : `Map fetch failed: ${out.netError ?? "unknown network error"}`,
+  });
+}
+
+/** Original-source fetch (map without sourcesContent) — same page-context path. */
+async function fetchPageResourceFor(url: string, requestToken: number) {
+  const out = await loadPageResource(url);
+  if (out.ok) post({ type: "page-resource", requestToken, content: out.content });
+  else {
+    post({
+      type: "page-resource",
+      requestToken,
+      error: out.httpStatus ? `HTTP ${out.httpStatus}` : out.netError ?? "fetch failed",
+    });
+  }
+}
+
 async function getScriptSource(scriptId: string, requestToken: number) {
   try {
     const { scriptSource } = await sendCdp<{ scriptSource: string }>(
@@ -1268,11 +1520,16 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       break;
     }
     case "Page.frameNavigated": {
-      const p = params as unknown as { frame: { parentId?: string } };
+      const p = params as unknown as {
+        frame: { id: string; url?: string; parentId?: string };
+      };
       if (p.frame.parentId) break; // sub-frames don't reset the session
       // New document: parsed scripts are per-document, and the "already
       // loaded" hint no longer applies — we're attached from the first byte.
+      mainFrameId = p.frame.id;
+      pageUrl = p.frame.url;
       scripts.clear();
+      post({ type: "scripts", scripts: [] }); // diagnostics list resets live
       alreadyLoaded = false;
       if (autoCapture) {
         // Auto-capture: re-assert persisted breakpoints and in-page hooks on
@@ -1287,13 +1544,20 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     }
     case "Debugger.scriptParsed": {
       const p = params as unknown as ScriptParsedParams;
-      if (p.url) {
-        scripts.set(p.scriptId, {
-          scriptId: p.scriptId,
-          url: p.url,
-          hasSourceMap: !!p.sourceMapURL,
-        });
-      }
+      // Register EVERY script — eval'd Module Federation modules often have no
+      // URL (or a webpack:// pseudo-URL) yet carry an inline sourceMapURL, and
+      // frames key into this registry by scriptId. CDP hands us sourceMapURL
+      // directly; the script text is never fetched or regexed for it.
+      const script: ScriptInfo = {
+        scriptId: p.scriptId,
+        url: p.url ?? "",
+        sourceMapURL: p.sourceMapURL || undefined,
+        hasSourceURL: p.hasSourceURL,
+        executionContextId: p.executionContextId,
+      };
+      scripts.set(p.scriptId, script);
+      // Live update: lazily-loaded MFE remote chunks parse long after load.
+      post({ type: "script-parsed", script });
       break;
     }
     case "Debugger.breakpointResolved": {
@@ -1343,7 +1607,10 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       // causes; the panel shows explicit guidance instead of failing silently.
       const asyncFrames = flattenStack(p.asyncStackTrace).map((f) => ({
         functionName: f.functionName,
-        scriptId: "",
+        // Real scriptId when CDP provides one (async parents do) — needed for
+        // source-map resolution; separator rows keep "". Async frames still
+        // carry no callFrameId/scopeChain: not steppable or inspectable.
+        scriptId: f.scriptId ?? "",
         url: f.url,
         lineNumber: f.lineNumber,
         columnNumber: f.columnNumber,
@@ -1456,6 +1723,12 @@ chrome.runtime.onConnect.addListener((p) => {
       case "get-scripts":
         post({ type: "scripts", scripts: [...scripts.values()] });
         break;
+      case "fetch-source-map":
+        void fetchSourceMapFor(msg.scriptId, msg.requestToken);
+        break;
+      case "fetch-page-resource":
+        void fetchPageResourceFor(msg.url, msg.requestToken);
+        break;
       case "get-script-source":
         void getScriptSource(msg.scriptId, msg.requestToken);
         break;
@@ -1493,6 +1766,7 @@ chrome.runtime.onConnect.addListener((p) => {
   pushStatus();
   // Replay current state so a reopened panel isn't empty.
   post({ type: "requests-snapshot", requests: [...requests.values()] });
+  post({ type: "scripts", scripts: [...scripts.values()] });
   pushBreakpoints();
   if (pausedState) post({ type: "paused", state: pausedState });
 });

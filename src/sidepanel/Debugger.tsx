@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type {
   BreakpointInfo,
   EventBreakpointInfo,
@@ -14,7 +14,10 @@ import type {
   ScriptInfo,
 } from "../shared/messages";
 import {
+  describeSourceMapStatus,
+  getSourceMapStatuses,
   resolveOriginalLocation,
+  subscribeSourceMapStatuses,
   type OriginalLocation,
 } from "./sourceMapResolver";
 import {
@@ -57,6 +60,7 @@ interface DebuggerProps {
   asyncDepth?: number;
   send: (msg: PanelToBg) => void;
   fetchProperties: (objectId: string) => Promise<RemoteProperty[]>;
+  onOpenSource: (scriptId: string, source: string, line: number) => void;
   onExplain: (prefillText: string) => void;
   onPickForHandler: (eventType: string) => void;
   onDismissCandidates: () => void;
@@ -85,14 +89,22 @@ export const DEFAULT_BLACKBOX: Record<string, string[]> = {
 const btnClass =
   "rounded bg-gray-200 px-2 py-1 text-xs font-medium text-gray-800 hover:bg-gray-300 disabled:opacity-50";
 
+function frameName(frame: PausedFrame, loc: OriginalLocation | null): string {
+  return loc?.name || frame.functionName || "(anonymous)";
+}
+
+function frameLocationText(frame: PausedFrame, loc: OriginalLocation | null): string {
+  if (loc) return `${loc.source}:${loc.line}`;
+  if (frame.url) return `${frame.url}:${frame.lineNumber}:${frame.columnNumber}`;
+  if (frame.scriptId) {
+    return `scriptId ${frame.scriptId}:${frame.lineNumber}:${frame.columnNumber}`;
+  }
+  return "(unknown script)";
+}
+
+/** Plain-text frame line for AI prompts — name and location space-separated. */
 function frameLabel(frame: PausedFrame, loc: OriginalLocation | null): string {
-  const name = loc?.name || frame.functionName || "(anonymous)";
-  const location = loc
-    ? `${loc.source}:${loc.line}`
-    : frame.url
-      ? `${frame.url}:${frame.lineNumber}:${frame.columnNumber}`
-      : "(unknown script)";
-  return `${name}  ${location}`;
+  return `${frameName(frame, loc)}  ${frameLocationText(frame, loc)}`;
 }
 
 function PropertyRow({
@@ -231,6 +243,7 @@ export default function Debugger({
   asyncDepth,
   send,
   fetchProperties,
+  onOpenSource,
   onExplain,
   onPickForHandler,
   onDismissCandidates,
@@ -253,7 +266,14 @@ export default function Debugger({
     setBlackboxText((DEFAULT_BLACKBOX[framework?.framework ?? "unknown"] ?? []).join("\n"));
   }, [framework?.framework]);
 
+  // Per-script source-map statuses — hover reasons for unmapped frames (Fix 4).
+  const mapStatuses = useSyncExternalStore(
+    subscribeSourceMapStatuses,
+    getSourceMapStatuses,
+  );
+
   // Re-resolve the stack (via the M2 consumer cache) whenever a pause lands.
+  // Keyed by scriptId, so eval'd/webpack:// frames resolve too.
   useEffect(() => {
     setSelectedFrame(0);
     if (!paused) {
@@ -263,7 +283,7 @@ export default function Debugger({
     let cancelled = false;
     void Promise.all(
       paused.callFrames.map((f) =>
-        resolveOriginalLocation(f.url, f.lineNumber, f.columnNumber),
+        resolveOriginalLocation(f.scriptId, f.lineNumber, f.columnNumber),
       ),
     ).then((locations) => {
       if (!cancelled) setFrameLocations(locations);
@@ -464,13 +484,22 @@ export default function Debugger({
                 );
               }
               const isEntry = chainResolved && i === entryIdx;
+              // Fix 7: badges, function name, and location are separate,
+              // explicitly-spaced spans — never concatenated text (the old
+              // rendering glued them into "your codeNn" / "entryen").
+              const unmappedReason =
+                !loc && f.scriptId
+                  ? mapStatuses[f.scriptId]?.state === "resolved"
+                    ? "map resolved, but this exact position has no original mapping"
+                    : describeSourceMapStatus(mapStatuses[f.scriptId])
+                  : null;
               return (
                 <li
                   key={i}
                   className={`flex items-center gap-1 ${isEntry ? "rounded bg-emerald-50" : ""}`}
                 >
                   <button
-                    className={`min-w-0 flex-1 break-all px-1 py-0.5 text-left font-mono text-xs ${
+                    className={`min-w-0 flex-1 px-1 py-0.5 text-left font-mono text-xs ${
                       i === selectedFrame ? "bg-blue-100" : "hover:bg-gray-100"
                     } ${cls === "framework" ? "text-gray-400" : ""}`}
                     title={
@@ -480,19 +509,41 @@ export default function Debugger({
                     }
                     onClick={() => setSelectedFrame(i)}
                   >
-                    {isEntry && (
-                      <span className="mr-1 rounded bg-emerald-600 px-1 py-px align-middle text-[10px] font-semibold text-white">
-                        ▶ entry
+                    <span className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
+                      {isEntry && (
+                        <span className="shrink-0 rounded bg-emerald-600 px-1 py-px text-[10px] font-semibold text-white">
+                          ▶ entry
+                        </span>
+                      )}
+                      {chainResolved && cls === "user" && !isEntry && (
+                        <span className="shrink-0 rounded bg-emerald-100 px-1 py-px text-[10px] font-semibold text-emerald-700">
+                          your code
+                        </span>
+                      )}
+                      <span className="font-medium">{frameName(f, loc)}</span>
+                      <span className="break-all text-gray-500">
+                        {frameLocationText(f, loc)}
                       </span>
-                    )}
-                    {chainResolved && cls === "user" && !isEntry && (
-                      <span className="mr-1 rounded bg-emerald-100 px-1 py-px align-middle text-[10px] font-semibold text-emerald-700">
-                        your code
-                      </span>
-                    )}
-                    {frameLabel(f, loc)}
+                      {unmappedReason && (
+                        <span
+                          className="shrink-0 cursor-help rounded bg-amber-100 px-1 py-px text-[10px] font-semibold text-amber-700"
+                          title={unmappedReason}
+                        >
+                          ⚠ unmapped
+                        </span>
+                      )}
+                    </span>
                   </button>
-                  {f.url && (
+                  {loc && (
+                    <button
+                      className="shrink-0 rounded bg-gray-200 px-1 text-[10px] hover:bg-gray-300"
+                      title="Open the original file at this line (Sources tab)"
+                      onClick={() => onOpenSource(f.scriptId, loc.source, loc.line)}
+                    >
+                      ↗
+                    </button>
+                  )}
+                  {(f.url || f.scriptId) && (
                     <button
                       className="shrink-0 rounded bg-gray-200 px-1 text-[10px] hover:bg-gray-300"
                       title="Set a permanent breakpoint at this frame — subsequent loads pause directly here"
@@ -500,6 +551,7 @@ export default function Debugger({
                         send({
                           type: "set-breakpoint",
                           url: f.url,
+                          scriptId: f.scriptId,
                           lineNumber: f.lineNumber,
                           columnNumber: f.columnNumber,
                           originalLabel: loc ? `${loc.source}:${loc.line}` : undefined,

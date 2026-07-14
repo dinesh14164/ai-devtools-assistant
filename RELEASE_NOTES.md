@@ -1,3 +1,34 @@
+# Release 4 — v1.3.0 (2026-07-14)
+
+## Source-map resolution fixed for micro-frontends, eval builds, and authenticated hosts
+
+Frames used to stay minified (`main.<hash>.js:0:877240`, mangled names) — and breakpoints landed in the bundle — even when DevTools' own Sources tab showed the real code. Resolution now works the way DevTools does, and when it can't, it says exactly why.
+
+### Discovery: `Debugger.scriptParsed` is the source of truth
+
+- The worker keeps a **script registry keyed by `scriptId`**, populated from `scriptParsed` — including `sourceMapURL` straight off the event. The old approach (fetch the script text, regex for a trailing `//# sourceMappingURL=`) is gone; it completely broke on webpack's `eval-source-map` / `eval-cheap-module-source-map` (standard in Module Federation dev builds), where the map is an inline `data:` URI inside each `eval()`. Inline maps now decode locally with **zero network**.
+- **Frames carry `scriptId` everywhere** (initiator stacks, paused frames, async parents, extracted handlers) and resolution keys off it — scripts with empty or `webpack://` pseudo-URLs resolve fine. URLs are display-only.
+- Breakpoints on URL-less (eval'd) scripts bind via `Debugger.setBreakpoint(scriptId)` automatically.
+
+### Fetching: the page's network context, with the page's credentials
+
+- Source maps (and non-embedded original sources) are fetched via **CDP `Network.loadNetworkResource`** (+ `IO.read`) in the page's context, `includeCredentials: true` — exactly like DevTools. Maps on authenticated internal hosts no longer silently 401. A credentialed extension fetch remains as fallback only when the CDP path is unavailable.
+- **Per-script, per-origin:** each MFE bundle/remote (container host, `http://localhost` remotes, lazy chunks) resolves independently. Explicit localhost host permissions added; HTTPS-page-loading-HTTP-map failures are diagnosed as **mixed content** rather than a generic error.
+
+### Transparency: no silent failures
+
+- New **"Source maps" diagnostics panel** (Sources tab) lists every parsed script grouped by origin with a live status — `resolved` (source count), `no-map`, `fetch-failed` (HTTP code / net error), `parse-failed`, `pending` — plus per-script **Retry/Load**. Lazily-parsed MFE chunks appear as they arrive.
+- Every unmapped frame shows a **⚠ badge with the exact reason on hover** ("map fetch failed: 401", "no source map", "map parse error: …").
+- An aggregate hint appears when several maps fail with 401/403 (deployment/auth guidance).
+
+### Reaching the real code
+
+- **Resolved frame locations are clickable** → the Sources tab opens the original file at that line, highlighted. Content comes from the map's embedded `sourcesContent` (no network, no auth) or, failing that, a page-context fetch.
+- In the original-file view, **click a line number to set a breakpoint on that original line** — reverse-mapped into the shipped bundle.
+- Cosmetic: frame rows render badges / function name / location as separately spaced elements (no more `your codeNn`, `entryen`).
+
+---
+
 # Release 3 — v1.2.0 (2026-07-13)
 
 ## Lifecycle & load-time request debugging

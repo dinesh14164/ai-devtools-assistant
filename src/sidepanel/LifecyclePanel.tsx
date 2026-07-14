@@ -27,7 +27,8 @@ const MAX_FILES_WITH_HITS = 50;
 
 interface FileHits {
   file: string; // original source path, or generated URL when unmapped
-  scriptUrl: string; // generated script URL (what breakpoints bind to)
+  scriptId: string; // resolution key (reverse mapping is per-script)
+  scriptUrl: string; // generated script URL (display; "" for eval'd scripts)
   mapped: boolean; // true = `file` is an original source needing reverse mapping
   hits: LifecycleHit[];
 }
@@ -98,18 +99,24 @@ export default function LifecyclePanel({
       for (const script of candidates.slice(0, MAX_SCRIPTS_SCANNED)) {
         if (found.length >= MAX_FILES_WITH_HITS) break;
         let scannedOriginals = false;
-        if (script.hasSourceMap) {
-          const sources = await getOriginalSources(script.url);
+        if (script.sourceMapURL) {
+          const sources = await getOriginalSources(script.scriptId);
           if (sources) {
             scannedOriginals = true;
             for (const source of sources) {
               if (found.length >= MAX_FILES_WITH_HITS) break;
               if (!isUserPath(source)) continue; // skip node_modules inside the map
-              const content = await getOriginalSourceContent(script.url, source);
+              const content = await getOriginalSourceContent(script.scriptId, source);
               if (!content) continue;
               const hits = scanSourceForHooks(content, hooks);
               if (hits.length > 0) {
-                found.push({ file: source, scriptUrl: script.url, mapped: true, hits });
+                found.push({
+                  file: source,
+                  scriptId: script.scriptId,
+                  scriptUrl: script.url,
+                  mapped: true,
+                  hits,
+                });
               }
             }
           }
@@ -122,7 +129,13 @@ export default function LifecyclePanel({
             if (content.length <= 2_000_000) {
               const hits = scanSourceForHooks(content, hooks);
               if (hits.length > 0) {
-                found.push({ file: script.url, scriptUrl: script.url, mapped: false, hits });
+                found.push({
+                  file: script.url,
+                  scriptId: script.scriptId,
+                  scriptUrl: script.url,
+                  mapped: false,
+                  hits,
+                });
               }
             }
           } catch {
@@ -159,7 +172,7 @@ export default function LifecyclePanel({
     setNote(null);
     if (fileHits.mapped) {
       const gen = await resolveGeneratedPosition(
-        fileHits.scriptUrl,
+        fileHits.scriptId,
         fileHits.file,
         hit.line,
       );
@@ -172,6 +185,7 @@ export default function LifecyclePanel({
       send({
         type: "set-breakpoint",
         url: fileHits.scriptUrl,
+        scriptId: fileHits.scriptId,
         lineNumber: gen.lineNumber,
         columnNumber: gen.columnNumber,
         originalLabel: `${fileHits.file}:${hit.line} (${hit.name})`,
@@ -181,6 +195,7 @@ export default function LifecyclePanel({
       send({
         type: "set-breakpoint",
         url: fileHits.scriptUrl,
+        scriptId: fileHits.scriptId,
         lineNumber: hit.line - 1, // scan lines are 1-based; CDP wants 0-based
         originalLabel: `${hit.name} @ line ${hit.line}`,
         tag: "lifecycle",
@@ -266,7 +281,7 @@ export default function LifecyclePanel({
       {visible.length > 0 && (
         <ul className="mt-2 max-h-64 space-y-2 overflow-y-auto">
           {visible.map((f) => (
-            <li key={`${f.scriptUrl}|${f.file}`}>
+            <li key={`${f.scriptId}|${f.file}`}>
               <p className="break-all font-mono text-[11px] font-semibold text-gray-700">
                 {f.file}
                 {!f.mapped && (

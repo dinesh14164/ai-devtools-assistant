@@ -7,7 +7,14 @@ export default defineManifest({
   // "scripting" powers the element picker: the picker function is injected
   // on demand via chrome.scripting.executeScript — no always-on content script.
   permissions: ["debugger", "sidePanel", "tabs", "storage", "scripting"],
-  host_permissions: ["<all_urls>"],
+  // Explicit localhost/loopback entries alongside <all_urls>: MFE remotes are
+  // commonly served from a local dev server, and some Chrome policies exclude
+  // loopback from <all_urls> — their source maps must stay fetchable.
+  host_permissions: [
+    "<all_urls>",
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+  ],
   // MV3 blocks WebAssembly on extension pages by default; the source-map
   // library's mapping engine is WASM, so the panel needs wasm-unsafe-eval.
   content_security_policy: {
