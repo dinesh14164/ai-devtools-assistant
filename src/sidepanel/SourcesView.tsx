@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { js as beautifyJs } from "js-beautify";
 import type { ScriptInfo } from "../shared/messages";
 import {
@@ -14,12 +14,61 @@ const ATTACH_CAP = 8000; // chars — keep source context token-sane
 // normally a few hundred lines; this only guards pathological files).
 const MAX_GUTTER_LINES = 20_000;
 
-/** A "jump to original source" request (clicked frame → file at line). */
-export interface SourcesNavTarget {
-  scriptId: string;
-  source: string; // exact map `sources` entry
-  line: number; // 1-based original line
-  nonce: number;
+/** A "jump to source" request (clicked frame → file at line). */
+export type SourcesNavTarget =
+  | {
+      kind: "original";
+      scriptId: string;
+      source: string; // exact map `sources` entry
+      line: number; // 1-based original line
+      nonce: number;
+    }
+  | {
+      kind: "generated"; // unresolved frame → pretty-printed minified script
+      scriptId: string;
+      lineNumber: number; // 0-based generated (CDP convention)
+      columnNumber: number;
+      nonce: number;
+    };
+
+// ---- Generated-position → beautified-line mapping. js-beautify only moves
+// whitespace, so the count of non-whitespace characters before a position is
+// invariant: count them in the raw text up to (line, col), then find the
+// beautified line holding the same count. ----
+
+function rawOffsetOf(text: string, line0: number, col0: number): number {
+  let offset = 0;
+  for (let l = 0; l < line0; l++) {
+    const next = text.indexOf("\n", offset);
+    if (next === -1) break;
+    offset = next + 1;
+  }
+  return Math.min(offset + col0, text.length);
+}
+
+function mapToBeautifiedLine(
+  raw: string,
+  beautified: string,
+  line0: number,
+  col0: number,
+): number {
+  const limit = rawOffsetOf(raw, line0, col0);
+  let target = 0;
+  for (let i = 0; i < limit; i++) {
+    const c = raw.charCodeAt(i);
+    if (c !== 32 && c !== 9 && c !== 10 && c !== 13) target++;
+  }
+  let count = 0;
+  let line = 1;
+  for (let i = 0; i < beautified.length; i++) {
+    const c = beautified.charCodeAt(i);
+    if (c === 10) line++;
+    else if (c !== 32 && c !== 9 && c !== 13) {
+      count++;
+      if (count > target) return line;
+    }
+  }
+  return line;
 }
 
 interface SourcesViewProps {
@@ -60,14 +109,17 @@ export default function SourcesView({
   const [note, setNote] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [highlightLine, setHighlightLine] = useState<number | null>(null);
-  const highlightRef = useRef<HTMLDivElement | null>(null);
+  const highlightRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     refreshScripts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const openScript = async (script: ScriptInfo) => {
+  const openScript = async (
+    script: ScriptInfo,
+    genLoc?: { lineNumber: number; columnNumber: number },
+  ) => {
     setSelected(script);
     setViewingOriginal("");
     setOriginalSources([]);
@@ -85,13 +137,23 @@ export default function SourcesView({
       if (source.length > 2_000_000) {
         setContent(source.slice(0, 2_000_000));
         setNote("Very large script — shown raw and truncated.");
+        if (genLoc) setHighlightLine(genLoc.lineNumber + 1);
       } else if (looksMinified(source)) {
-        setContent(beautifyJs(source, { indent_size: 2 }));
+        const pretty = beautifyJs(source, { indent_size: 2 });
+        setContent(pretty);
         setNote(
           "Minified — pretty-printed for reading. Line numbers here do NOT match the shipped bundle (breakpoints still use real generated lines).",
         );
+        // Beautification only moves whitespace, so the frame's generated
+        // position maps into the pretty text by non-whitespace offset.
+        if (genLoc) {
+          setHighlightLine(
+            mapToBeautifiedLine(source, pretty, genLoc.lineNumber, genLoc.columnNumber),
+          );
+        }
       } else {
         setContent(source);
+        if (genLoc) setHighlightLine(genLoc.lineNumber + 1);
       }
       return origList ?? [];
     } catch (e) {
@@ -137,8 +199,9 @@ export default function SourcesView({
     setLoading(false);
   };
 
-  // Fix 6: external navigation — a clicked resolved frame lands here at the
-  // original file + line, with the line highlighted.
+  // External navigation — a clicked frame lands here: resolved frames at the
+  // original file + line, unresolved frames in the pretty-printed generated
+  // script at the mapped position (both highlighted).
   useEffect(() => {
     if (!navigate) return;
     const script = scripts.find((s) => s.scriptId === navigate.scriptId);
@@ -147,6 +210,13 @@ export default function SourcesView({
       return;
     }
     void (async () => {
+      if (navigate.kind === "generated") {
+        await openScript(script, {
+          lineNumber: navigate.lineNumber,
+          columnNumber: navigate.columnNumber,
+        });
+        return;
+      }
       if (selected?.scriptId !== script.scriptId) await openScript(script);
       await openOriginal(script, navigate.source, navigate.line);
     })();
@@ -184,10 +254,11 @@ export default function SourcesView({
     (s.url || "(anonymous)").toLowerCase().includes(filter.toLowerCase()),
   );
 
-  const gutterLines =
-    viewingOriginal && content !== null && content.split("\n").length <= MAX_GUTTER_LINES
-      ? content.split("\n")
-      : null;
+  const allLines = content !== null ? content.split("\n") : null;
+  const gutterLines = allLines && allLines.length <= MAX_GUTTER_LINES ? allLines : null;
+  // Breakpoints arm only from ORIGINAL lines (reverse mapping needs the exact
+  // map source); pretty-printed generated line numbers don't match the bundle.
+  const canBreakOnLines = !!viewingOriginal;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -289,12 +360,21 @@ export default function SourcesView({
               return (
                 <div
                   key={i}
-                  ref={isTarget ? highlightRef : undefined}
+                  ref={isTarget ? (highlightRef as RefObject<HTMLDivElement | null>) : undefined}
                   className={`flex ${isTarget ? "bg-amber-200/70" : ""}`}
                 >
                   <button
-                    className="w-12 shrink-0 select-none border-r border-gray-200 pr-2 text-right text-gray-400 hover:bg-blue-100 hover:text-blue-700"
-                    title="Set a breakpoint on this original line (reverse-mapped into the shipped bundle)"
+                    className={`w-12 shrink-0 select-none border-r border-gray-200 pr-2 text-right ${
+                      canBreakOnLines
+                        ? "text-gray-400 hover:bg-blue-100 hover:text-blue-700"
+                        : "cursor-help text-gray-300"
+                    }`}
+                    title={
+                      canBreakOnLines
+                        ? "Set a breakpoint on this original line (reverse-mapped into the shipped bundle)"
+                        : "Line numbers in the pretty-printed generated view don't match the shipped bundle — set breakpoints from original sources or stack frames"
+                    }
+                    disabled={!canBreakOnLines}
                     onClick={() => void breakOnLine(lineNo)}
                   >
                     {lineNo}
@@ -307,9 +387,26 @@ export default function SourcesView({
             })}
           </div>
         )}
-        {!loading && content !== null && gutterLines === null && (
+        {!loading && allLines !== null && gutterLines === null && (
+          // Too many lines for per-row rendering: plain <pre>, with the target
+          // line wrapped in a highlighted span so navigation still lands.
           <pre className="select-text whitespace-pre p-2 font-mono text-[11px] leading-4">
-            {content}
+            {highlightLine !== null && highlightLine <= allLines.length ? (
+              <>
+                {allLines.slice(0, highlightLine - 1).join("\n")}
+                {highlightLine > 1 ? "\n" : ""}
+                <span
+                  ref={highlightRef as RefObject<HTMLSpanElement | null>}
+                  className="bg-amber-200/70"
+                >
+                  {allLines[highlightLine - 1] || " "}
+                </span>
+                {highlightLine < allLines.length ? "\n" : ""}
+                {allLines.slice(highlightLine).join("\n")}
+              </>
+            ) : (
+              content
+            )}
           </pre>
         )}
         {!loading && content === null && !selected && (

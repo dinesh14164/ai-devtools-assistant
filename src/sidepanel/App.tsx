@@ -42,6 +42,8 @@ import Debugger, {
   type HandlerCandidates,
 } from "./Debugger";
 import SourcesView, { type SourcesNavTarget } from "./SourcesView";
+import { fileNameOf, originLabelOf, prettySourcePath } from "./framePath";
+import type { EntryCandidate } from "./entryPointAgent";
 import {
   DEFAULT_QUESTIONS,
   type Attachment,
@@ -104,13 +106,17 @@ function formatVariables(variables: unknown): string {
 function FrameRow({
   frame,
   mapStatus,
+  originChip,
   onBreak,
   onOpenSource,
+  onOpenGenerated,
 }: {
   frame: ResolvedFrame;
   mapStatus: SourceMapStatus | undefined;
+  originChip: string | null; // shown only when the origin differs from the previous frame
   onBreak: (frame: ResolvedFrame) => void;
   onOpenSource: (frame: ResolvedFrame) => void;
+  onOpenGenerated: (scriptId: string, lineNumber: number, columnNumber: number) => void;
 }) {
   if (frame.isAsyncSeparator) {
     return (
@@ -119,11 +125,22 @@ function FrameRow({
       </li>
     );
   }
-  const rawLocation = frame.raw.url
+  const rawLocationFull = frame.raw.url
     ? `${frame.raw.url}:${frame.raw.lineNumber}:${frame.raw.columnNumber}`
     : frame.raw.scriptId
       ? `scriptId ${frame.raw.scriptId}:${frame.raw.lineNumber}:${frame.raw.columnNumber}`
       : null;
+  const rawLocationDisplay = frame.raw.url
+    ? `${fileNameOf(frame.raw.url)}:${frame.raw.lineNumber}:${frame.raw.columnNumber}`
+    : rawLocationFull;
+  const chip = originChip ? (
+    <span
+      className="shrink-0 rounded bg-sky-100 px-1 py-px font-mono text-[10px] font-semibold text-sky-700"
+      title={frame.raw.url}
+    >
+      {originChip}
+    </span>
+  ) : null;
   // Breakable when the frame identifies a real script — by URL or (eval'd
   // webpack modules) by scriptId.
   const breakButton =
@@ -137,7 +154,8 @@ function FrameRow({
       </button>
     ) : null;
   if (!frame.resolved) {
-    // Fix 4: never silent — an unmapped frame says why on hover.
+    // Never silent — an unmapped frame says why on hover; with a scriptId it
+    // still navigates, to the pretty-printed generated script.
     const reason = !frame.raw.scriptId
       ? "no script attribution (native/synthetic frame)"
       : mapStatus?.state === "resolved"
@@ -145,6 +163,7 @@ function FrameRow({
         : describeSourceMapStatus(mapStatus);
     return (
       <li className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
+        {chip}
         <span className="font-mono">{frame.raw.functionName || "(anonymous)"}</span>
         <span
           className="cursor-help rounded bg-amber-100 px-1 py-px align-middle text-[10px] font-semibold text-amber-700"
@@ -153,16 +172,35 @@ function FrameRow({
           ⚠ {mapStatus?.state === "no-map" || !frame.raw.scriptId ? "no source map" : "unmapped"}
         </span>
         {breakButton}
-        {rawLocation && (
-          <span className="break-all font-mono text-xs text-gray-500" title={reason}>
-            {rawLocation}
-          </span>
-        )}
+        {rawLocationDisplay &&
+          (frame.raw.scriptId ? (
+            <button
+              className="break-all text-left font-mono text-xs text-gray-600 underline decoration-dotted hover:text-gray-900"
+              title={`${rawLocationFull} — click to open the generated script (pretty-printed) at this position`}
+              onClick={() =>
+                onOpenGenerated(
+                  frame.raw.scriptId,
+                  frame.raw.lineNumber,
+                  frame.raw.columnNumber,
+                )
+              }
+            >
+              {rawLocationDisplay}
+            </button>
+          ) : (
+            <span
+              className="cursor-help break-all font-mono text-xs text-gray-500"
+              title={`${rawLocationFull ?? ""} — not navigable: ${reason}`}
+            >
+              {rawLocationDisplay}
+            </span>
+          ))}
       </li>
     );
   }
   return (
     <li className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
+      {chip}
       <span className="font-mono">
         {frame.resolved.name || frame.raw.functionName || "(anonymous)"}
       </span>
@@ -172,14 +210,18 @@ function FrameRow({
       {breakButton}
       <button
         className="break-all text-left font-mono text-xs text-blue-700 underline decoration-dotted hover:text-blue-900"
-        title="Open the original file at this line (Sources tab)"
+        title={`${frame.resolved.source} — click to open the original file at this line`}
         onClick={() => onOpenSource(frame)}
       >
-        {frame.resolved.source}:{frame.resolved.line}:{frame.resolved.column}
+        {prettySourcePath(frame.resolved.source)}:{frame.resolved.line}:
+        {frame.resolved.column}
       </button>
-      {rawLocation && (
-        <span className="w-full break-all font-mono text-[10px] text-gray-400">
-          {rawLocation}
+      {rawLocationDisplay && (
+        <span
+          className="w-full break-all font-mono text-[10px] text-gray-400"
+          title={rawLocationFull ?? undefined}
+        >
+          {rawLocationDisplay}
         </span>
       )}
     </li>
@@ -699,11 +741,32 @@ export default function App() {
     setView("debug");
   };
 
-  // Fix 6: a clicked resolved frame opens the ORIGINAL file at its line in
-  // the Sources tab (sourcesContent-backed — usually zero extra network).
+  // A clicked resolved frame opens the ORIGINAL file at its line in the
+  // Sources tab (sourcesContent-backed — usually zero extra network).
   const openOriginalSource = (scriptId: string, source: string, line: number) => {
-    setSourcesNav({ scriptId, source, line, nonce: Date.now() });
+    setSourcesNav({ kind: "original", scriptId, source, line, nonce: Date.now() });
     setView("sources");
+  };
+
+  // A clicked UNRESOLVED frame still reaches something: the generated script,
+  // pretty-printed, highlighted at the mapped position.
+  const openGeneratedSource = (
+    scriptId: string,
+    lineNumber: number,
+    columnNumber: number,
+  ) => {
+    setSourcesNav({ kind: "generated", scriptId, lineNumber, columnNumber, nonce: Date.now() });
+    setView("sources");
+  };
+
+  // "Break at entry point" from the Find-entry-point agent: reverse-map the
+  // confirmed original line and arm it. Confirmation happens in the panel.
+  const breakAtCandidate = async (candidate: EntryCandidate): Promise<string | null> => {
+    const script = candidate.scriptId
+      ? scripts.find((s) => s.scriptId === candidate.scriptId)
+      : undefined;
+    if (!script) return "That candidate's script is no longer loaded (page navigated?).";
+    return breakOnOriginalLine(script, candidate.file, candidate.line);
   };
 
   // Fix 6: breakpoint from an original-source line — reverse-map, then arm.
@@ -1140,23 +1203,37 @@ export default function App() {
                 </p>
               ) : (
                 <ol className="mt-1 list-decimal space-y-1 pl-5">
-                  {displayFrames.map((f, i) => (
-                    <FrameRow
-                      key={i}
-                      frame={f}
-                      mapStatus={mapStatuses[f.raw.scriptId]}
-                      onBreak={(fr) => void setBreakpointFromFrame(fr)}
-                      onOpenSource={(fr) => {
-                        if (fr.resolved) {
-                          openOriginalSource(
-                            fr.raw.scriptId,
-                            fr.resolved.source,
-                            fr.resolved.line,
-                          );
-                        }
-                      }}
-                    />
-                  ))}
+                  {displayFrames.map((f, i) => {
+                    // Origin chip only when the origin changes vs the previous
+                    // real frame (MFE container/remote boundaries stay visible).
+                    const origin = f.isAsyncSeparator ? null : originLabelOf(f.raw.url);
+                    let prevOrigin: string | null = null;
+                    for (let j = i - 1; j >= 0; j--) {
+                      if (!displayFrames[j].isAsyncSeparator) {
+                        prevOrigin = originLabelOf(displayFrames[j].raw.url);
+                        break;
+                      }
+                    }
+                    return (
+                      <FrameRow
+                        key={i}
+                        frame={f}
+                        mapStatus={mapStatuses[f.raw.scriptId]}
+                        originChip={origin && origin !== prevOrigin ? origin : null}
+                        onBreak={(fr) => void setBreakpointFromFrame(fr)}
+                        onOpenSource={(fr) => {
+                          if (fr.resolved) {
+                            openOriginalSource(
+                              fr.raw.scriptId,
+                              fr.resolved.source,
+                              fr.resolved.line,
+                            );
+                          }
+                        }}
+                        onOpenGenerated={openGeneratedSource}
+                      />
+                    );
+                  })}
                 </ol>
               )}
             </>
@@ -1183,6 +1260,12 @@ export default function App() {
           send={send}
           fetchProperties={fetchProperties}
           onOpenSource={openOriginalSource}
+          onOpenGenerated={openGeneratedSource}
+          requests={requests}
+          config={config}
+          onBreakAtCandidate={breakAtCandidate}
+          onOpenSettings={() => setView("settings")}
+          onOpenSourcesTab={() => setView("sources")}
           onExplain={(text) => {
             setPrefill({ text, nonce: Date.now() });
             setView("chat");

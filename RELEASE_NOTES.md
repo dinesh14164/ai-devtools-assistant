@@ -1,3 +1,31 @@
+# Release 5 — v1.4.0 (2026-07-15)
+
+## "Find entry point" (agentic) + call-stack display & navigation
+
+### Find entry point — an evidence-grounded agent for broken async chains
+
+When a request breakpoint pauses in 100% framework code (zone.js, RxJS, the Apollo link chain), the stack can't be walked back — the developer's frames are gone. But the **heap is not**: framework closures still hold the component/service instances that started the chain. The new **"Find entry point"** button (paused view) runs a bounded tool loop against your **active model profile** that inspects live scopes, recognizes user classes by constructor name, and verifies the originating method in your **original sources**.
+
+- **Seven fixed, read-only tools** (`get_stack`, `get_scope`, `inspect_object`, `search_sources`, `get_source`, `get_request`, `get_framework`) implemented on existing plumbing (M2 maps, M4 scopes, M5 sources, the "my code" classifier). **No evaluate-style tool exists** — the model can never run JS in the page, resume, step, or mutate anything; the pause survives the whole run (and cancellation).
+- **Live investigation log in plain language** ("Inspecting frame 12 scopes… → 34 variables across 2 scopes", "Searching your sources for \"TicketsListComponent\"… → 3 matches"), with elapsed time and Cancel. The same log becomes the **"How this was found"** evidence trail — every line links to its frame or file:line for verification.
+- Results are **never a bare verdict**: entry point + checkable evidence chain; multiple candidates are ranked for the user to pick. Files/lines the tools never returned are dropped (anti-hallucination guard).
+- **"Break at entry point"** asks for confirmation, then arms a reverse-mapped source-line breakpoint. **Never automatic.**
+- **Loud failure path:** on cap/exhaustion, the partial log + strongest candidates + fallbacks (Break on lifecycle, search manually, raw frames) are shown.
+- Bounded (12 tool calls), cached per origin + request/operation, provider-agnostic via a strict JSON tool protocol over the plain chat API (no native tool-calling required), and gated on a configured model profile (same empty-state as chat).
+
+### Call stack display (all frame lists: paused, initiator, evidence)
+
+- **Hosts and bundler prefixes stripped**: resolved frames show project-relative paths (`src/app/tickets/tickets.component.ts:42`, not `webpack:///./src/…`); unresolved frames show the bare filename (`main.<hash>.js:0:877240`). Full URL/path on hover.
+- **Origin chips** appear only when a frame's origin differs from the previous frame's — MFE container↔remote boundaries stay visible without repeating the host on every row.
+
+### Click a frame → open it in Sources
+
+- Every frame with a known location is clickable (underline + hover affordance): **resolved** frames open the original file (embedded `sourcesContent` first, page-context fetch fallback) at the highlighted line; **unresolved** frames open the pretty-printed generated script **at the mapped position** (generated→beautified positions mapped by whitespace-invariant offset).
+- Breakpoints arm directly from original-source lines (existing reverse mapping); pretty-printed generated line numbers are clearly marked non-armable.
+- Frames with no reachable source are non-clickable and explain why on hover (source-map status reasons).
+
+---
+
 # Release 4 — v1.3.0 (2026-07-14)
 
 ## Source-map resolution fixed for micro-frontends, eval builds, and authenticated hosts

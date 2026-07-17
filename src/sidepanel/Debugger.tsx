@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type {
   BreakpointInfo,
+  CapturedRequest,
   EventBreakpointInfo,
   ExtractedHandler,
   FrameworkId,
@@ -13,6 +14,10 @@ import type {
   RemoteProperty,
   ScriptInfo,
 } from "../shared/messages";
+import type { ModelConfigState } from "./modelConfig";
+import type { EntryCandidate } from "./entryPointAgent";
+import EntryPointPanel from "./EntryPointPanel";
+import { fileNameOf, originLabelOf, prettySourcePath } from "./framePath";
 import {
   describeSourceMapStatus,
   getSourceMapStatuses,
@@ -61,6 +66,13 @@ interface DebuggerProps {
   send: (msg: PanelToBg) => void;
   fetchProperties: (objectId: string) => Promise<RemoteProperty[]>;
   onOpenSource: (scriptId: string, source: string, line: number) => void;
+  onOpenGenerated: (scriptId: string, lineNumber: number, columnNumber: number) => void;
+  // ---- "Find entry point" (agentic) ----
+  requests: CapturedRequest[];
+  config: ModelConfigState;
+  onBreakAtCandidate: (candidate: EntryCandidate) => Promise<string | null>;
+  onOpenSettings: () => void;
+  onOpenSourcesTab: () => void;
   onExplain: (prefillText: string) => void;
   onPickForHandler: (eventType: string) => void;
   onDismissCandidates: () => void;
@@ -93,7 +105,18 @@ function frameName(frame: PausedFrame, loc: OriginalLocation | null): string {
   return loc?.name || frame.functionName || "(anonymous)";
 }
 
-function frameLocationText(frame: PausedFrame, loc: OriginalLocation | null): string {
+/** Display form (Part B): project-relative path / bare filename, host stripped. */
+function frameLocationDisplay(frame: PausedFrame, loc: OriginalLocation | null): string {
+  if (loc) return `${prettySourcePath(loc.source)}:${loc.line}`;
+  if (frame.url) return `${fileNameOf(frame.url)}:${frame.lineNumber}:${frame.columnNumber}`;
+  if (frame.scriptId) {
+    return `scriptId ${frame.scriptId}:${frame.lineNumber}:${frame.columnNumber}`;
+  }
+  return "(unknown script)";
+}
+
+/** Full-fidelity location — hover titles and AI prompt text. */
+function frameLocationFull(frame: PausedFrame, loc: OriginalLocation | null): string {
   if (loc) return `${loc.source}:${loc.line}`;
   if (frame.url) return `${frame.url}:${frame.lineNumber}:${frame.columnNumber}`;
   if (frame.scriptId) {
@@ -104,7 +127,7 @@ function frameLocationText(frame: PausedFrame, loc: OriginalLocation | null): st
 
 /** Plain-text frame line for AI prompts — name and location space-separated. */
 function frameLabel(frame: PausedFrame, loc: OriginalLocation | null): string {
-  return `${frameName(frame, loc)}  ${frameLocationText(frame, loc)}`;
+  return `${frameName(frame, loc)}  ${frameLocationFull(frame, loc)}`;
 }
 
 function PropertyRow({
@@ -244,6 +267,12 @@ export default function Debugger({
   send,
   fetchProperties,
   onOpenSource,
+  onOpenGenerated,
+  requests,
+  config,
+  onBreakAtCandidate,
+  onOpenSettings,
+  onOpenSourcesTab,
   onExplain,
   onPickForHandler,
   onDismissCandidates,
@@ -260,6 +289,8 @@ export default function Debugger({
   const [handlerEventType, setHandlerEventType] = useState("click");
   const [blackboxText, setBlackboxText] = useState("");
   const [explaining, setExplaining] = useState(false);
+  // Bumped by the "Find entry point" buttons; the panel runs on change.
+  const [agentNonce, setAgentNonce] = useState<number | null>(null);
 
   // Track defaults for the resolved framework; the user can edit before Apply.
   useEffect(() => {
@@ -323,24 +354,10 @@ export default function Debugger({
     paused?.reason === "XHR" || paused?.reason === "GraphQLOperation";
   const chainBroken = chainResolved && isRequestPause && entryIdx === -1;
 
-  // Part 5: narrow AI assist — offered ONLY when the classifier found no user
-  // frame; presented as a heuristic suggestion, answered by the active model.
-  const askAiForEntryPoint = () => {
-    if (!paused) return;
-    const stackLines = paused.callFrames.map(
-      (f, i) => `  ${frameLabel(f, frameLocations[i] ?? null)}`,
-    );
-    onExplain(
-      `[Heuristic — AI suggestion, please verify] Execution paused on a request ` +
-        `(${paused.reason}${paused.detail ? `: ${paused.detail}` : ""}), but no frame in the ` +
-        `stack classifies as my own code (framework: ${framework?.framework ?? "unknown"}). ` +
-        `From the call chain below (innermost first; "[async: …]" rows are async boundaries), ` +
-        `which frame is most likely MY application's entry point — the function in my code ` +
-        `that started this chain — rather than framework internals? Name the function and ` +
-        `file:line so I can set a breakpoint there (⏸ button in the Debug tab).\n\n` +
-        `Call chain:\n${stackLines.join("\n")}`,
-    );
-  };
+  // The agentic "Find entry point" (tool loop over live scopes + sources)
+  // replaced the old one-shot stack-text prompt: it grounds its answer in
+  // checkable tool results instead of guessing from frame names.
+  const startFindEntryPoint = () => setAgentNonce(Date.now());
 
   const addXhrBreakpoint = () => {
     const url = xhrInput.trim();
@@ -460,9 +477,16 @@ export default function Debugger({
             >
               {explaining ? "Preparing…" : "Explain this pause"}
             </button>
+            <button
+              className="rounded bg-emerald-600 px-2 py-1 text-xs font-medium text-white hover:bg-emerald-700"
+              title="AI agent (read-only tools) traces this request back to the function in YOUR code that originated it — inspects frame scopes, finds your objects, and verifies against your original sources"
+              onClick={startFindEntryPoint}
+            >
+              Find entry point
+            </button>
           </div>
 
-          <h3 className="mt-2 text-xs font-semibold text-gray-700">
+          <h3 id="paused-call-chain" className="mt-2 text-xs font-semibold text-gray-700">
             Call chain{" "}
             <span className="font-normal text-gray-500">
               (framework dimmed{entryIdx >= 0 ? ", ▶ = entry point in your code" : ""})
@@ -484,68 +508,102 @@ export default function Debugger({
                 );
               }
               const isEntry = chainResolved && i === entryIdx;
-              // Fix 7: badges, function name, and location are separate,
-              // explicitly-spaced spans — never concatenated text (the old
-              // rendering glued them into "your codeNn" / "entryen").
+              // Badges, function name, and location are separate, explicitly
+              // spaced elements — never concatenated text.
               const unmappedReason =
                 !loc && f.scriptId
                   ? mapStatuses[f.scriptId]?.state === "resolved"
                     ? "map resolved, but this exact position has no original mapping"
                     : describeSourceMapStatus(mapStatuses[f.scriptId])
                   : null;
+              // Origin chip (Part B): shown only when this frame's origin
+              // differs from the previous real frame's — MFE origin changes
+              // stay visible without repeating the host on every row.
+              const origin = originLabelOf(f.url);
+              let prevOrigin: string | null = null;
+              for (let j = i - 1; j >= 0; j--) {
+                if (frameClasses[j] !== "separator") {
+                  prevOrigin = originLabelOf(paused.callFrames[j].url);
+                  break;
+                }
+              }
+              const originChip = origin && origin !== prevOrigin ? origin : null;
+              const locationFull = frameLocationFull(f, loc);
               return (
                 <li
                   key={i}
-                  className={`flex items-center gap-1 ${isEntry ? "rounded bg-emerald-50" : ""}`}
+                  className={`flex flex-wrap items-center gap-x-1.5 gap-y-0.5 px-1 py-0.5 ${
+                    isEntry ? "rounded bg-emerald-50" : ""
+                  } ${i === selectedFrame ? "bg-blue-50" : ""}`}
                 >
+                  {originChip && (
+                    <span
+                      className="shrink-0 rounded bg-sky-100 px-1 py-px font-mono text-[10px] font-semibold text-sky-700"
+                      title={f.url}
+                    >
+                      {originChip}
+                    </span>
+                  )}
+                  {isEntry && (
+                    <span className="shrink-0 rounded bg-emerald-600 px-1 py-px text-[10px] font-semibold text-white">
+                      ▶ entry
+                    </span>
+                  )}
+                  {chainResolved && cls === "user" && !isEntry && (
+                    <span className="shrink-0 rounded bg-emerald-100 px-1 py-px text-[10px] font-semibold text-emerald-700">
+                      your code
+                    </span>
+                  )}
                   <button
-                    className={`min-w-0 flex-1 px-1 py-0.5 text-left font-mono text-xs ${
-                      i === selectedFrame ? "bg-blue-100" : "hover:bg-gray-100"
-                    } ${cls === "framework" ? "text-gray-400" : ""}`}
+                    className={`min-w-0 break-all text-left font-mono text-xs font-medium ${
+                      i === selectedFrame ? "" : "hover:bg-gray-100"
+                    } ${cls === "framework" ? "text-gray-400" : "text-gray-900"}`}
                     title={
                       cls === "framework"
-                        ? "framework / ignored code"
-                        : "your code — click to inspect, ⏸ to break here instead"
+                        ? "framework / ignored code — click to inspect its scopes"
+                        : "your code — click to inspect its scopes"
                     }
                     onClick={() => setSelectedFrame(i)}
                   >
-                    <span className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
-                      {isEntry && (
-                        <span className="shrink-0 rounded bg-emerald-600 px-1 py-px text-[10px] font-semibold text-white">
-                          ▶ entry
-                        </span>
-                      )}
-                      {chainResolved && cls === "user" && !isEntry && (
-                        <span className="shrink-0 rounded bg-emerald-100 px-1 py-px text-[10px] font-semibold text-emerald-700">
-                          your code
-                        </span>
-                      )}
-                      <span className="font-medium">{frameName(f, loc)}</span>
-                      <span className="break-all text-gray-500">
-                        {frameLocationText(f, loc)}
-                      </span>
-                      {unmappedReason && (
-                        <span
-                          className="shrink-0 cursor-help rounded bg-amber-100 px-1 py-px text-[10px] font-semibold text-amber-700"
-                          title={unmappedReason}
-                        >
-                          ⚠ unmapped
-                        </span>
-                      )}
-                    </span>
+                    {frameName(f, loc)}
                   </button>
-                  {loc && (
+                  {/* Part C: the location itself navigates — original source
+                      when resolved, pretty-printed generated script otherwise. */}
+                  {f.scriptId ? (
                     <button
-                      className="shrink-0 rounded bg-gray-200 px-1 text-[10px] hover:bg-gray-300"
-                      title="Open the original file at this line (Sources tab)"
-                      onClick={() => onOpenSource(f.scriptId, loc.source, loc.line)}
+                      className={`min-w-0 break-all text-left font-mono text-xs underline decoration-dotted ${
+                        cls === "framework"
+                          ? "text-gray-400 hover:text-gray-600"
+                          : "text-blue-700 hover:text-blue-900"
+                      }`}
+                      title={`${locationFull} — click to open in Sources`}
+                      onClick={() =>
+                        loc
+                          ? onOpenSource(f.scriptId, loc.source, loc.line)
+                          : onOpenGenerated(f.scriptId, f.lineNumber, f.columnNumber)
+                      }
                     >
-                      ↗
+                      {frameLocationDisplay(f, loc)}
                     </button>
+                  ) : (
+                    <span
+                      className="min-w-0 cursor-help break-all font-mono text-xs text-gray-400"
+                      title={`${locationFull} — not navigable: ${unmappedReason ?? "no script attribution"}`}
+                    >
+                      {frameLocationDisplay(f, loc)}
+                    </span>
+                  )}
+                  {unmappedReason && (
+                    <span
+                      className="shrink-0 cursor-help rounded bg-amber-100 px-1 py-px text-[10px] font-semibold text-amber-700"
+                      title={unmappedReason}
+                    >
+                      ⚠ unmapped
+                    </span>
                   )}
                   {(f.url || f.scriptId) && (
                     <button
-                      className="shrink-0 rounded bg-gray-200 px-1 text-[10px] hover:bg-gray-300"
+                      className="ml-auto shrink-0 rounded bg-gray-200 px-1 text-[10px] hover:bg-gray-300"
                       title="Set a permanent breakpoint at this frame — subsequent loads pause directly here"
                       onClick={() =>
                         send({
@@ -605,15 +663,30 @@ export default function Debugger({
                   Break on lifecycle ↓
                 </button>
                 <button
-                  className="rounded bg-violet-600 px-2 py-1 text-xs font-medium text-white hover:bg-violet-700"
-                  title="Heuristic: asks your active model which frame is your entry point — confirm before trusting"
-                  onClick={askAiForEntryPoint}
+                  className="rounded bg-emerald-600 px-2 py-1 text-xs font-medium text-white hover:bg-emerald-700"
+                  title="AI agent with read-only tools: inspects the paused scopes for your objects and verifies the origin in your sources — every claim grounded in checkable evidence"
+                  onClick={startFindEntryPoint}
                 >
-                  Ask AI to find my entry point
+                  Find entry point
                 </button>
               </div>
             </div>
           )}
+
+          <EntryPointPanel
+            paused={paused}
+            scripts={scripts}
+            requests={requests}
+            framework={framework}
+            ignorePatterns={ignoreList}
+            config={config}
+            fetchProperties={fetchProperties}
+            startNonce={agentNonce}
+            onOpenSource={onOpenSource}
+            onBreakAt={onBreakAtCandidate}
+            onOpenSettings={onOpenSettings}
+            onOpenSourcesTab={onOpenSourcesTab}
+          />
 
           <h3 className="mt-2 text-xs font-semibold text-gray-700">Scope</h3>
           {paused.callFrames[selectedFrame]?.scopeChain
