@@ -182,6 +182,20 @@ export interface ScriptInfo {
 // auth resolve. Every failure carries an explicit machine-readable reason so
 // the UI can always answer "why isn't it using the real files?". ----
 
+// Which acquisition strategy actually produced the map — surfaced in
+// diagnostics so a "how did this resolve" question is always answerable.
+// "comment-scan" is a LAST-RESORT-ONLY fallback (script-fetch + trailing
+// //# sourceMappingURL= comment) for the rare case where scriptParsed itself
+// carried no sourceMapURL; scriptParsed's sourceMapURL remains the primary
+// and near-universal discovery path.
+export type SourceMapFetchStrategy =
+  | "inline" // data: URI in sourceMapURL — no network
+  | "cdp-frame" // Network.loadNetworkResource, the frame that actually loaded the script
+  | "cdp-top-frame" // same, retried against the top frame
+  | "worker-fetch" // background service worker fetch() — not subject to page CSP/mixed-content
+  | "panel-fetch" // panel-context fetch() — works when the dev server sends permissive CORS
+  | "comment-scan"; // Debugger.getScriptSource + trailing-comment parse (last resort)
+
 export type SourceMapFetchResult =
   | {
       ok: true;
@@ -189,15 +203,17 @@ export type SourceMapFetchResult =
       mapUrl: string; // "(inline data: URI)" for embedded maps
       inline: boolean;
       mapJson: string;
+      strategy: SourceMapFetchStrategy;
     }
   | {
       ok: false;
       scriptId: string;
       mapUrl?: string;
       reason:
-        | "no-map" // scriptParsed had no sourceMapURL
+        | "no-map" // scriptParsed had no sourceMapURL, and no comment-scan match either
         | "unresolvable-url" // relative ref with no resolvable base (webpack://)
         | "mixed-content" // HTTPS page + HTTP non-localhost map (MFE remotes)
+        | "tls-error" // self-signed/untrusted cert on a local dev server
         | "fetch-failed";
       httpStatus?: number;
       netError?: string;

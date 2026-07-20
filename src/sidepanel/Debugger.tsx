@@ -382,6 +382,20 @@ export default function Debugger({
   // parent inward): the function in the developer's code that started the
   // chain — for init-time requests, typically the lifecycle hook.
   const entryIdx = chainResolved ? findEntryPointIndex(frameClasses) : -1;
+  // Per-class counts (never collapse "unknown" into "user") — surfaces a
+  // source-map problem (many "unknown") as visually distinct from a stack
+  // that's genuinely all framework code.
+  const classCounts = useMemo(() => {
+    let user = 0;
+    let framework = 0;
+    let unknown = 0;
+    for (const c of frameClasses) {
+      if (c === "user") user++;
+      else if (c === "framework") framework++;
+      else if (c === "unknown") unknown++;
+    }
+    return { user, framework, unknown };
+  }, [frameClasses]);
   const isRequestPause =
     paused?.reason === "XHR" || paused?.reason === "GraphQLOperation";
   const chainBroken = chainResolved && isRequestPause && entryIdx === -1;
@@ -404,6 +418,17 @@ export default function Debugger({
       progressAnchorRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
   }, [agentNonce]);
+
+  // EntryPointPanel reports null exactly when it's no longer busy (indexing
+  // or running) — mirror that back into agentRunning so the button's own
+  // disabled+spinner state clears once the run actually finishes. Without
+  // this, agentRunning (set true synchronously on click, for instant
+  // feedback) would stay stuck true forever after the first completed run,
+  // since nothing else ever reset it back to false.
+  const handleAgentStatusChange = (status: AgentRunStatus | null) => {
+    setAgentStatus(status);
+    if (status === null) setAgentRunning(false);
+  };
 
   const addXhrBreakpoint = () => {
     const url = xhrInput.trim();
@@ -573,7 +598,7 @@ export default function Debugger({
               onBreakAt={onBreakAtCandidate}
               onOpenSettings={onOpenSettings}
               onOpenSourcesTab={onOpenSourcesTab}
-              onStatusChange={setAgentStatus}
+              onStatusChange={handleAgentStatusChange}
             />
           </div>
 
@@ -583,6 +608,22 @@ export default function Debugger({
               (framework dimmed{entryIdx >= 0 ? ", ▶ = entry point in your code" : ""})
             </span>
           </h3>
+          {chainResolved && (
+            <p className="text-[11px] text-gray-500">
+              {frameClasses.length} frames — {classCounts.user} user,{" "}
+              {classCounts.framework} framework,{" "}
+              <span className={classCounts.unknown > 0 ? "font-semibold text-gray-700" : ""}>
+                {classCounts.unknown} unknown
+              </span>
+              {classCounts.unknown > 0 && classCounts.user === 0 && (
+                <span className="ml-1 text-amber-700">
+                  — {classCounts.unknown === frameClasses.length - classCounts.framework
+                    ? "check the Source Maps diagnostics; this usually means maps failed to load"
+                    : "some frames couldn't be confirmed as your code"}
+                </span>
+              )}
+            </p>
+          )}
           <ul className="mt-0.5">
             {paused.callFrames.map((f, i) => {
               const loc = frameLocations[i] ?? null;
@@ -648,11 +689,19 @@ export default function Debugger({
                   <button
                     className={`min-w-0 break-all text-left font-mono text-xs font-medium ${
                       i === selectedFrame ? "" : "hover:bg-gray-100"
-                    } ${cls === "framework" ? "text-gray-400" : "text-gray-900"}`}
+                    } ${
+                      cls === "framework"
+                        ? "text-gray-400"
+                        : cls === "unknown"
+                          ? "text-gray-600"
+                          : "text-gray-900"
+                    }`}
                     title={
                       cls === "framework"
                         ? "framework / ignored code — click to inspect its scopes"
-                        : "your code — click to inspect its scopes"
+                        : cls === "unknown"
+                          ? "unresolved — can't confirm this is your code — click to inspect its scopes"
+                          : "your code — click to inspect its scopes"
                     }
                     onClick={() => setSelectedFrame(i)}
                   >
@@ -665,7 +714,9 @@ export default function Debugger({
                       className={`min-w-0 break-all text-left font-mono text-xs underline decoration-dotted ${
                         cls === "framework"
                           ? "text-gray-400 hover:text-gray-600"
-                          : "text-blue-700 hover:text-blue-900"
+                          : cls === "unknown"
+                            ? "text-gray-500 hover:text-gray-700"
+                            : "text-blue-700 hover:text-blue-900"
                       }`}
                       title={`${locationFull} — click to open in Sources`}
                       onClick={() =>
@@ -684,13 +735,29 @@ export default function Debugger({
                       {frameLocationDisplay(f, loc)}
                     </span>
                   )}
-                  {unmappedReason && (
+                  {/* "unknown" gets its own badge — distinct from both "your
+                      code" and a plain unmapped-framework-frame warning. This
+                      is the frame class that used to be silently mislabeled
+                      "user" whenever a map failed to load (the MFE bug). */}
+                  {cls === "unknown" ? (
                     <span
-                      className="shrink-0 cursor-help rounded bg-amber-100 px-1 py-px text-[10px] font-semibold text-amber-700"
-                      title={unmappedReason}
+                      className="shrink-0 cursor-help rounded bg-gray-200 px-1 py-px text-[10px] font-semibold text-gray-700"
+                      title={
+                        unmappedReason ??
+                        "Unresolved — no source map (or it failed to load), so this frame can't be confirmed as your code."
+                      }
                     >
-                      ⚠ unmapped
+                      ? unknown
                     </span>
+                  ) : (
+                    unmappedReason && (
+                      <span
+                        className="shrink-0 cursor-help rounded bg-amber-100 px-1 py-px text-[10px] font-semibold text-amber-700"
+                        title={unmappedReason}
+                      >
+                        ⚠ unmapped
+                      </span>
+                    )
                   )}
                   {(f.url || f.scriptId) && (
                     <button

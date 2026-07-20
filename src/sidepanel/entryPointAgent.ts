@@ -8,12 +8,15 @@ import type {
 import { getProvider, type ChatMessage } from "./providers";
 import type { ModelProfile } from "./modelConfig";
 import {
+  describeSourceMapStatus,
   getOriginalSources,
   getOriginalSourceContent,
+  getSourceMapStatuses,
   resolveOriginalLocation,
 } from "./sourceMapResolver";
-import { classifyFrame, compileIgnorePatterns } from "./codeClassifier";
+import { classifyFrame, classifyPath, compileIgnorePatterns } from "./codeClassifier";
 import { originLabelOf, prettySourcePath } from "./framePath";
+import type { IndexStatus } from "./sourceIndex";
 
 // "Find entry point" (agentic). The paused stack is often 100% framework code
 // because the request was scheduled across async boundaries after the
@@ -79,6 +82,12 @@ export interface AgentDeps {
   framework: FrameworkResolution | null;
   ignorePatterns: string[];
   fetchProperties: (objectId: string) => Promise<RemoteProperty[]>;
+  // Whether/where the source index is empty or partial (Fix 2) — the caller
+  // (EntryPointPanel) gates a fully-empty index before ever starting the
+  // agent; this is passed through so a PARTIAL index (e.g. one MFE remote
+  // unindexed while the rest resolved) is part of the agent's own context,
+  // so it can name the gap instead of concluding "no matches."
+  indexStatus: IndexStatus;
 }
 
 // ---- Result cache: one confirmed investigation per (origin + trigger) ----
@@ -107,13 +116,20 @@ const SYSTEM_PROMPT = `You are a debugging agent inside a browser DevTools exten
 Key technique: framework closures on the paused frames still reference the developer's objects. Scope variables and object previews include CONSTRUCTOR NAMES (e.g. "TicketsListComponent") — a user-class constructor name is often the decisive clue. Find such an instance, locate its class in the original sources, and verify which of its methods issues the paused request.
 
 TOOLS (all read-only; you cannot execute code, resume, or step):
-- get_stack {} — paused stack, source-map resolved, each frame classified "user" or "framework".
+- get_stack {} — paused stack, source-map resolved, each real frame classified "user", "framework", or "unknown".
 - get_scope {"frameIndex": number} — scope variables of one frame (names, types, previews with constructor names, objectIds).
 - inspect_object {"objectId": string} — expand an object's properties one level (previews include constructor names).
 - search_sources {"query": string} — full-text search across the developer's ORIGINAL sources (ignore-listed paths excluded). Returns file, line, snippet.
 - get_source {"file": string, "lineFrom": number, "lineTo": number} — read a range of an original file. "file" must be an EXACT file string previously returned by a tool.
 - get_request {} — the request that triggered this pause (URL, method, GraphQL operation/query/variables if applicable).
 - get_framework {} — detected framework and ignore-list patterns.
+
+FRAME CLASSIFICATION — three states, not two:
+- "user": this frame's location was SUCCESSFULLY resolved through a source map to a file not on the ignore list. Only this state means "confirmed as the developer's own code."
+- "framework": ignore-listed (node_modules, zone.js, the bundler runtime, or the user's own blackbox patterns), resolved or not.
+- "unknown": UNRESOLVED — no source map, or the map failed to load — and not ignore-listed. This is NOT user code and NOT framework code; it is a frame we have no source for. A stack that is mostly or entirely "unknown" indicates a SOURCE-MAP PROBLEM (a script's map failed to fetch — check get_stack's per-frame "unresolvedReason"), not an absent handler. Never treat an "unknown" frame as evidence the developer's code is absent, and never propose an "unknown" frame's location as an entry point — you have no source there to confirm anything.
+
+SOURCE INDEX — search_sources searches ORIGINAL files pulled from resolved source maps. If a search returns filesScanned: 0, this means the index itself is empty or the relevant origin never indexed — it is NOT evidence your query text is absent from the code. Never report "the code doesn't contain this" from a filesScanned: 0 result; report the indexing problem instead, and if only some origins are missing, name which ones.
 
 RESPONSE CONTRACT — reply with EXACTLY ONE JSON object and nothing else (no markdown fences, no prose):
 - To call a tool: {"tool": "<name>", "args": { ... }}
@@ -122,8 +138,9 @@ RESPONSE CONTRACT — reply with EXACTLY ONE JSON object and nothing else (no ma
 RULES:
 - Ground EVERY claim in tool results. Never guess or invent a file/line you have not seen in a tool result this conversation.
 - "file" values must be exact strings from tool results (map source paths), not prettified.
+- An entryPoint or candidate's "file" must come from a RESOLVED, "user"-classified location — never from an "unknown" frame's raw script location.
 - Each evidence item must be independently checkable (state what was observed and where).
-- If you cannot close the chain, finish with outcome "partial" and your strongest candidates — do not keep calling tools without a plan.
+- If you cannot close the chain, finish with outcome "partial" and your strongest candidates — do not keep calling tools without a plan. If the reason you can't close the chain is a source-map/indexing problem (many "unknown" frames, or filesScanned: 0), say that explicitly in the summary rather than implying the code doesn't exist.
 - You have a budget of ${MAX_TOOL_CALLS} tool calls. Be economical: start with get_stack and get_request.`;
 
 // ---- JSON extraction (models occasionally add fences/prose) ----
@@ -169,7 +186,7 @@ class ToolBox {
   }
 
   private isUserPath(path: string): boolean {
-    return classifyFrame({ functionName: "", url: path }, null, this.compiled) === "user";
+    return classifyPath(path, this.compiled) === "user";
   }
 
   private async sourcesOf(scriptId: string): Promise<string[] | null> {
@@ -189,6 +206,7 @@ class ToolBox {
   }
 
   async get_stack(): Promise<ToolOutcome> {
+    const mapStatuses = getSourceMapStatuses();
     const frames = await Promise.all(
       this.deps.paused.callFrames.map(async (f, index) => {
         if (f.functionName.startsWith("[async:")) {
@@ -199,24 +217,44 @@ class ToolBox {
         return {
           index,
           functionName: loc?.name || f.functionName || "(anonymous)",
-          classification: cls,
+          classification: cls, // "user" | "framework" | "unknown"
+          resolved: !!loc,
           file: loc ? loc.source : undefined,
           line: loc ? loc.line : undefined,
           rawUrl: !loc ? f.url || `(scriptId ${f.scriptId})` : undefined,
           rawLine: !loc ? f.lineNumber : undefined,
+          // Only present when unresolved — WHY (no map / fetch failed + reason
+          // / parse failed). This is what makes "unknown" diagnosable instead
+          // of a dead end.
+          unresolvedReason:
+            !loc && f.scriptId ? describeSourceMapStatus(mapStatuses[f.scriptId]) : undefined,
           hasScopes: f.scopeChain.length > 0,
         };
       }),
     );
-    const userCount = frames.filter(
-      (f) => "classification" in f && f.classification === "user",
-    ).length;
+    let userCount = 0;
+    let frameworkCount = 0;
+    let unknownCount = 0;
+    for (const f of frames) {
+      if (!("classification" in f)) continue;
+      if (f.classification === "user") userCount++;
+      else if (f.classification === "framework") frameworkCount++;
+      else if (f.classification === "unknown") unknownCount++;
+    }
+    const finding =
+      userCount > 0
+        ? `${frames.length} frames — ${userCount} user, ${frameworkCount} framework, ${unknownCount} unknown`
+        : unknownCount > 0
+          ? `${frames.length} frames — ${frameworkCount} framework, ${unknownCount} unknown (unresolved — a source-map problem, NOT confirmed as user or framework code)`
+          : `${frames.length} frames — no user code (all ${frameworkCount} framework)`;
     return {
-      result: { reason: this.deps.paused.reason, detail: this.deps.paused.detail, frames },
-      finding:
-        userCount > 0
-          ? `${frames.length} frames — ${userCount} in your code`
-          : `${frames.length} frames — no user code (all framework)`,
+      result: {
+        reason: this.deps.paused.reason,
+        detail: this.deps.paused.detail,
+        frames,
+        counts: { user: userCount, framework: frameworkCount, unknown: unknownCount },
+      },
+      finding,
     };
   }
 
@@ -311,6 +349,21 @@ class ToolBox {
       }
     }
     const files = [...new Set(matches.map((m) => m.file))];
+    if (filesScanned === 0) {
+      // 0 files scanned means the index is empty (or nothing here indexed) —
+      // this must never read as "the code doesn't contain this."
+      return {
+        result: {
+          query,
+          matches: [],
+          filesScanned: 0,
+          indexEmpty: true,
+          error:
+            "Source index is empty — 0 original files were searchable. This means source maps failed to load, NOT that your code doesn't contain this query. Report the source-map problem, don't conclude 'no matches.'",
+        },
+        finding: `source index is empty — 0 files scanned (this is a source-map problem, not "no matches")`,
+      };
+    }
     return {
       result: {
         query,
@@ -463,6 +516,18 @@ async function buildCandidate(
 
 // ---- The loop ----
 
+/** One line of index-status context for the agent's initial message. */
+function indexStatusLine(index: IndexStatus): string {
+  const failing = index.origins.filter((o) => o.totalScripts > 0 && o.resolvedScripts === 0);
+  if (failing.length === 0) {
+    return `Source index: ${index.totalFiles} original files indexed across ${index.resolvedScripts} script(s), all origins resolved. `;
+  }
+  return (
+    `Source index: ${index.totalFiles} original files indexed, but these origins FAILED to index and their code is NOT searchable: ` +
+    `${failing.map((o) => o.origin).join(", ")}. If the entry point may live in one of these origins, say so explicitly — do not conclude "no matches" for code you can't search. `
+  );
+}
+
 async function complete(
   profile: ModelProfile,
   messages: ChatMessage[],
@@ -492,6 +557,7 @@ export async function runEntryPointAgent(
         `Execution is paused (reason: ${deps.paused.reason}` +
         `${deps.paused.detail ? `, detail: ${deps.paused.detail}` : ""}). ` +
         `Framework: ${deps.framework?.framework ?? "unknown"}. ` +
+        indexStatusLine(deps.indexStatus) +
         `Find the entry point in the developer's own code that originated this request.`,
     },
   ];

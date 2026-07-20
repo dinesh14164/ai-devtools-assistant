@@ -8,12 +8,15 @@ export default defineManifest({
   // on demand via chrome.scripting.executeScript — no always-on content script.
   permissions: ["debugger", "sidePanel", "tabs", "storage", "scripting"],
   // Explicit localhost/loopback entries alongside <all_urls>: MFE remotes are
-  // commonly served from a local dev server, and some Chrome policies exclude
-  // loopback from <all_urls> — their source maps must stay fetchable.
+  // commonly served from a local dev server (often HTTPS with a self-signed
+  // cert), and some Chrome policies exclude loopback from <all_urls> — their
+  // source maps must stay fetchable regardless of scheme or port.
   host_permissions: [
     "<all_urls>",
     "http://localhost/*",
+    "https://localhost/*",
     "http://127.0.0.1/*",
+    "https://127.0.0.1/*",
   ],
   // MV3 blocks WebAssembly on extension pages by default; the source-map
   // library's mapping engine is WASM, so the panel needs wasm-unsafe-eval.

@@ -14,17 +14,25 @@ import {
   type EntryCandidate,
   type EvidenceLink,
 } from "./entryPointAgent";
+import { computeIndexStatus, ensureIndexed, type IndexStatus } from "./sourceIndex";
 
 // The "Find entry point" panel: live-appending investigation log (plain
 // language + findings, never raw tool names), which BECOMES the evidence
 // trail on completion — one component, not two. Runs only on explicit click
 // from a live pause; cancellation aborts the loop and preserves the pause.
 //
-// Visibility fixes (this revision): the button-adjacent box appears on the
-// SAME render as the click (no waiting on this component's own effect), the
-// step log auto-follows the latest step unless the user scrolled up, a
-// sticky top-of-view status line (rendered by the PARENT via
-// onStatusChange — see AgentRunStatus below) stays visible regardless of
+// Fix 2 (index gating): before ever calling the agent, this proactively
+// builds the source index (ensureIndexed) and checks it. An EMPTY index is a
+// blocking condition — the agent burning its whole tool budget re-discovering
+// "0 files scanned" via search_sources is exactly the failure mode being
+// fixed, so we refuse to start and point at diagnostics instead. A PARTIAL
+// index (e.g. one MFE remote failed while the rest resolved) doesn't block,
+// but stays visible as a warning through the whole run.
+//
+// Visibility fixes (carried from the previous revision): the button-adjacent
+// box appears on the SAME render as the click, the step log auto-follows the
+// latest step unless the user scrolled up, a sticky top-of-view status line
+// (rendered by the PARENT via onStatusChange) stays visible regardless of
 // scroll position, a slow tool call surfaces an interim "still working"
 // line, and the log collapses into the result on completion with the result
 // scrolled into view.
@@ -45,7 +53,7 @@ interface EntryPointPanelProps {
   // message or null on success. Caller-side confirmation happens HERE.
   onBreakAt: (candidate: EntryCandidate) => Promise<string | null>;
   onOpenSettings: () => void;
-  onOpenSourcesTab: () => void;
+  onOpenSourcesTab: () => void; // also where the source-map diagnostics panel lives
   // Reports live run status so the PARENT can render a sticky bar spanning
   // the whole Debug view — a bar sticky-positioned inside this component
   // would only stay pinned within this component's own (short) height, not
@@ -59,7 +67,7 @@ export interface AgentRunStatus {
   onCancel: () => void;
 }
 
-type Phase = "idle" | "no-profile" | "running" | "done";
+type Phase = "idle" | "no-profile" | "indexing" | "index-empty" | "running" | "done";
 
 const STATE_ICON: Record<AgentStep["state"], string> = {
   running: "⟳",
@@ -196,6 +204,7 @@ export default function EntryPointPanel({
   const [phase, setPhase] = useState<Phase>("idle");
   const [steps, setSteps] = useState<AgentStep[]>([]);
   const [result, setResult] = useState<AgentResult | null>(null);
+  const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
   const [armNote, setArmNote] = useState<string | null>(null);
   const [stepsExpanded, setStepsExpanded] = useState(true);
   const [autoFollow, setAutoFollow] = useState(true);
@@ -209,17 +218,21 @@ export default function EntryPointPanel({
   // flash) during that transient window.
   const runStartRef = useRef(Date.now());
   const stepStartRef = useRef<{ id: number; since: number } | null>(null);
-  const prevRunningRef = useRef(false);
+  const prevBusyRef = useRef(false);
   const logRef = useRef<HTMLUListElement | null>(null);
   const resultRef = useRef<HTMLDivElement | null>(null);
 
   // A click has happened this pause the instant startNonce is non-null —
   // render SOMETHING from the very next paint, without waiting for the
   // effect below to actually invoke start(). "No frame may look unchanged
-  // after the click."
+  // after the click." Indexing is the first REAL phase after a click, so
+  // that's the transient placeholder now (not "running").
   const hasStarted = startNonce !== null;
-  const displayPhase: Phase = phase === "idle" && hasStarted ? "running" : phase;
-  const running = displayPhase === "running";
+  const displayPhase: Phase = phase === "idle" && hasStarted ? "indexing" : phase;
+  // "busy" spans BOTH indexing and the agent loop proper — continuous
+  // feedback, no dead time between the click and the first tool call.
+  const busy = displayPhase === "indexing" || displayPhase === "running";
+  const agentRunning = displayPhase === "running";
 
   // A NEW pause is a new investigation context: reset the panel (the
   // cross-pause result cache in the agent module is unaffected). This
@@ -230,6 +243,7 @@ export default function EntryPointPanel({
     setPhase("idle");
     setSteps([]);
     setResult(null);
+    setIndexStatus(null);
     setArmNote(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paused.pauseId]);
@@ -237,12 +251,12 @@ export default function EntryPointPanel({
   // Clear the parent's sticky-bar status on unmount (e.g. resumed mid-run).
   useEffect(() => () => onStatusChange(null), [onStatusChange]);
 
-  // Tick while running — drives elapsed time and the "still working" hints.
+  // Tick while busy — drives elapsed time and the "still working" hints.
   useEffect(() => {
-    if (!running) return;
+    if (!busy) return;
     const t = setInterval(() => setNowTick(Date.now()), 500);
     return () => clearInterval(t);
-  }, [running]);
+  }, [busy]);
 
   const start = async (force: boolean) => {
     if (runningRef.current) return;
@@ -254,27 +268,73 @@ export default function EntryPointPanel({
     const controller = new AbortController();
     abortRef.current = controller;
     runningRef.current = true;
-    runStartRef.current = Date.now();
+    runStartRef.current = Date.now(); // clock starts at click, covers indexing too
     stepStartRef.current = null;
-    setPhase("running");
+    setPhase("indexing");
     setSteps([]);
     setResult(null);
+    setIndexStatus(null);
     setArmNote(null);
     setStepsExpanded(true);
     setAutoFollow(true);
     setNowTick(Date.now());
     try {
+      // Proactively resolve every candidate script's map BEFORE gating —
+      // otherwise a fresh session with nothing attempted yet would look
+      // "empty" on the very first run even though it would have succeeded.
+      await ensureIndexed(scripts);
+      if (controller.signal.aborted) {
+        setResult({
+          outcome: "cancelled",
+          summary: "Cancelled — the pause is preserved.",
+          candidates: [],
+          evidence: [],
+          steps: [],
+          toolCalls: 0,
+        });
+        setPhase("done");
+        return;
+      }
+      const status = computeIndexStatus(scripts);
+      setIndexStatus(status);
+      if (status.isEmpty) {
+        // Refuse to run — this is the exact failure mode being fixed: the
+        // agent burning its whole budget re-discovering "0 files scanned."
+        setPhase("index-empty");
+        return;
+      }
+      setPhase("running");
       const res = await runOrGetCached(
-        { profile, paused, scripts, requests, framework, ignorePatterns, fetchProperties },
+        {
+          profile,
+          paused,
+          scripts,
+          requests,
+          framework,
+          ignorePatterns,
+          fetchProperties,
+          indexStatus: status,
+        },
         setSteps,
         controller.signal,
         force,
       );
       if (res.fromCache) setSteps(res.steps);
       setResult(res);
+      setPhase("done");
+    } catch (e) {
+      setResult({
+        outcome: "error",
+        summary: "The investigation hit an error.",
+        candidates: [],
+        evidence: [],
+        steps: [],
+        toolCalls: 0,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      setPhase("done");
     } finally {
       runningRef.current = false;
-      setPhase("done");
     }
   };
 
@@ -300,16 +360,16 @@ export default function EntryPointPanel({
     setAutoFollow(el.scrollHeight - el.scrollTop - el.clientHeight < 24);
   };
 
-  // On completion (running -> not running), collapse the step log and
-  // scroll the RESULT into view — the answer is what the user should land
-  // on, for every outcome (found/partial/cancelled/error), not just success.
+  // On completion (busy -> not busy), collapse the step log and scroll the
+  // RESULT into view — the answer is what the user should land on, for
+  // every outcome (found/partial/cancelled/error/index-empty alike).
   useEffect(() => {
-    if (prevRunningRef.current && !running) {
+    if (prevBusyRef.current && !busy) {
       setStepsExpanded(false);
       resultRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
-    prevRunningRef.current = running;
-  }, [running]);
+    prevBusyRef.current = busy;
+  }, [busy]);
 
   // Track when the CURRENT running step started, to surface "still working"
   // once a single tool call runs past ~2s — the log must never look frozen.
@@ -324,24 +384,28 @@ export default function EntryPointPanel({
     }
   }, [runningStep?.id]);
   const stillWorking =
-    running && !!stepStartRef.current && nowTick - stepStartRef.current.since > STILL_WORKING_MS;
+    agentRunning &&
+    !!stepStartRef.current &&
+    nowTick - stepStartRef.current.since > STILL_WORKING_MS;
 
-  const elapsedSec = running ? Math.max(0, Math.floor((nowTick - runStartRef.current) / 1000)) : 0;
+  const elapsedSec = busy ? Math.max(0, Math.floor((nowTick - runStartRef.current) / 1000)) : 0;
   // Between tool calls there's no "running" step yet (waiting on the next
   // model turn) — say so instead of going quiet.
-  const currentStepLabel = !running
+  const currentStepLabel = !busy
     ? ""
-    : !steps.length
-      ? "Starting investigation…"
-      : runningStep
-        ? `${runningStep.label}${stillWorking ? " — still working…" : ""}`
-        : "Deciding next step…";
+    : displayPhase === "indexing"
+      ? "Checking your source index…"
+      : !steps.length
+        ? "Starting investigation…"
+        : runningStep
+          ? `${runningStep.label}${stillWorking ? " — still working…" : ""}`
+          : "Deciding next step…";
 
   // Report status up for the parent's sticky bar (spans the whole Debug
   // view — a locally-sticky bar here would only stay pinned within this
   // component's own short height).
   useEffect(() => {
-    if (!running) {
+    if (!busy) {
       onStatusChange(null);
       return;
     }
@@ -351,7 +415,7 @@ export default function EntryPointPanel({
       onCancel: () => abortRef.current?.abort(),
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [running, currentStepLabel, elapsedSec]);
+  }, [busy, currentStepLabel, elapsedSec]);
 
   const breakAt = async (candidate: EntryCandidate) => {
     // Never auto-arm: explicit confirmation gates every breakpoint.
@@ -396,6 +460,37 @@ export default function EntryPointPanel({
     );
   }
 
+  if (displayPhase === "index-empty") {
+    return (
+      <div className="mt-2 rounded border border-red-300 bg-red-50 p-2 text-xs">
+        <p className="font-semibold text-red-800">
+          No original sources are indexed — source maps aren't loading.
+        </p>
+        <p className="mt-1 text-red-700">
+          "Find entry point" can't search your code until this is fixed
+          {indexStatus && indexStatus.totalScripts > 0
+            ? ` (0 of ${indexStatus.totalScripts} scripts resolved).`
+            : "."}{" "}
+          It refused to run rather than burn its tool budget re-discovering this.
+        </p>
+        <div className="mt-2 flex flex-wrap gap-1">
+          <button
+            className="rounded bg-red-600 px-2 py-1 font-medium text-white hover:bg-red-700"
+            onClick={onOpenSourcesTab}
+          >
+            Open source-map diagnostics
+          </button>
+          <button
+            className="rounded bg-gray-200 px-2 py-0.5 font-medium text-gray-800 hover:bg-gray-300"
+            onClick={() => void start(true)}
+          >
+            Re-check
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   // Ranked secondary candidates, minus the primary (dedupe by file:line —
   // models often repeat the entry point in the candidates list).
   const secondary = (result?.candidates ?? []).filter(
@@ -406,29 +501,33 @@ export default function EntryPointPanel({
         c.line === result.entryPoint.line
       ),
   );
-  const showLog = running || stepsExpanded;
+  const showLog = agentRunning || stepsExpanded;
   const totalSteps = steps.length;
+  const failingOrigins =
+    indexStatus?.origins.filter((o) => o.totalScripts > 0 && o.resolvedScripts === 0) ?? [];
 
   return (
     <div className="mt-2 rounded border border-blue-200 bg-blue-50/50 p-2">
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-xs font-semibold text-gray-800">
-          {running
-            ? `Finding entry point… (${elapsedSec}s)`
-            : result?.outcome === "found"
-              ? "Entry point found"
-              : result?.outcome === "cancelled"
-                ? "Investigation cancelled"
-                : result?.outcome === "error"
-                  ? "Investigation failed"
-                  : "Entry point — partial findings"}
+          {displayPhase === "indexing"
+            ? `Checking your source index… (${elapsedSec}s)`
+            : agentRunning
+              ? `Finding entry point… (${elapsedSec}s)`
+              : result?.outcome === "found"
+                ? "Entry point found"
+                : result?.outcome === "cancelled"
+                  ? "Investigation cancelled"
+                  : result?.outcome === "error"
+                    ? "Investigation failed"
+                    : "Entry point — partial findings"}
         </span>
         {result?.fromCache && (
           <span className="rounded bg-gray-200 px-1.5 py-px text-[10px] font-semibold text-gray-600">
             cached
           </span>
         )}
-        {running ? (
+        {busy ? (
           <button
             className="rounded bg-gray-200 px-2 py-0.5 text-[11px] font-medium text-gray-800 hover:bg-gray-300"
             title="Aborts the investigation — the pause is preserved"
@@ -445,6 +544,20 @@ export default function EntryPointPanel({
           </button>
         )}
       </div>
+
+      {/* Partial-index warning — persists through running AND done so the
+          limitation is never lost, per Fix 5 ("the agent should say which
+          remote's sources are missing"). */}
+      {failingOrigins.length > 0 && (
+        <p className="mt-1 rounded border border-amber-300 bg-amber-50 p-1.5 text-[11px] text-amber-800">
+          Partial source index — {failingOrigins.map((o) => o.origin).join(", ")} failed to
+          index. The conclusion below may be incomplete for code from{" "}
+          {failingOrigins.length === 1 ? "that origin" : "those origins"}.{" "}
+          <button className="font-medium underline hover:no-underline" onClick={onOpenSourcesTab}>
+            Open diagnostics
+          </button>
+        </p>
+      )}
 
       {/* Entry point verdict first, when there is one — and the scroll
           target on completion, for every outcome. */}
@@ -473,7 +586,7 @@ export default function EntryPointPanel({
           then collapse into "How this was found" behind a toggle once done. */}
       {(totalSteps > 0 || (result?.evidence.length ?? 0) > 0) && (
         <div className="mt-2">
-          {!running && (
+          {!agentRunning && (
             <button
               className="text-[11px] font-semibold text-gray-600 hover:underline"
               onClick={() => setStepsExpanded((v) => !v)}
@@ -485,8 +598,8 @@ export default function EntryPointPanel({
           {showLog && (
             <ul
               ref={logRef}
-              onScroll={running ? handleLogScroll : undefined}
-              className={`mt-0.5 space-y-0.5 ${running ? "max-h-48 overflow-y-auto" : ""}`}
+              onScroll={agentRunning ? handleLogScroll : undefined}
+              className={`mt-0.5 space-y-0.5 ${agentRunning ? "max-h-48 overflow-y-auto" : ""}`}
             >
               {steps.map((s) => (
                 <StepLine
@@ -496,7 +609,7 @@ export default function EntryPointPanel({
                   onOpenSource={openLink}
                 />
               ))}
-              {!running &&
+              {!agentRunning &&
                 result?.evidence.map((ev, i) => (
                   <li key={`ev-${i}`} className="flex items-start gap-1.5 text-xs">
                     <span className="w-3 shrink-0 text-center text-emerald-600">✓</span>
@@ -514,7 +627,7 @@ export default function EntryPointPanel({
                     </span>
                   </li>
                 ))}
-              {running && !autoFollow && (
+              {agentRunning && !autoFollow && (
                 <li className="sticky bottom-0 -mx-2 mt-1 bg-blue-50 px-2 py-0.5 text-center text-[10px] text-blue-700">
                   <button className="hover:underline" onClick={() => setAutoFollow(true)}>
                     ↓ New steps below — jump to latest
@@ -527,7 +640,7 @@ export default function EntryPointPanel({
       )}
 
       {/* Ranked secondary candidates (the user picks). */}
-      {!running && secondary.length > 0 && (
+      {!agentRunning && secondary.length > 0 && (
         <div className="mt-2">
           <p className="text-[11px] font-semibold text-gray-600">
             {result?.entryPoint ? "Other candidates" : "Strongest candidates found"}
@@ -547,7 +660,7 @@ export default function EntryPointPanel({
       )}
 
       {/* Fallbacks + raw frames — always reachable, loud on failure. */}
-      {!running && result && (
+      {!busy && result && (
         <div className="mt-2 flex flex-wrap gap-1">
           <button
             className="rounded bg-gray-200 px-2 py-0.5 text-[11px] font-medium text-gray-800 hover:bg-gray-300"

@@ -5,7 +5,7 @@ import {
   getOriginalSourceContent,
   resolveGeneratedPosition,
 } from "./sourceMapResolver";
-import { classifyFrame, compileIgnorePatterns } from "./codeClassifier";
+import { classifyPath, compileIgnorePatterns } from "./codeClassifier";
 import {
   DEFAULT_LIFECYCLE_HOOKS,
   parseHookList,
@@ -91,8 +91,7 @@ export default function LifecyclePanel({
     setScanning(true);
     setNote(null);
     const compiled = compileIgnorePatterns(ignorePatterns);
-    const isUserPath = (url: string) =>
-      classifyFrame({ functionName: "", url }, null, compiled) === "user";
+    const isUserPath = (url: string) => classifyPath(url, compiled) === "user";
     const found: FileHits[] = [];
     try {
       const candidates = scripts.filter((s) => s.url && isUserPath(s.url));

@@ -19,6 +19,7 @@ import {
   type ScreenshotMode,
   type ScriptInfo,
   type SourceMapFetchResult,
+  type SourceMapFetchStrategy,
 } from "../shared/messages";
 import { decodeDataUri } from "../shared/dataUri";
 import { pickerScript } from "../content/picker";
@@ -146,9 +147,14 @@ let pausedState: PausedSnapshot | null = null;
 // re-post, which mutates the same object) — see PausedSnapshot.pauseId.
 let pauseSeq = 0;
 // Network.loadNetworkResource needs the frame whose network context (cookies,
-// credentials) the fetch should run in — always the main frame here.
+// credentials) the fetch should run in. The top frame is the default/retry
+// target; for MFE remote chunks the SCRIPT'S OWN frame (via
+// executionContextId -> frameId, from Runtime.executionContextCreated) is
+// tried first — a differently-originated resource can fail against the
+// wrong frame's network context.
 let mainFrameId: string | null = null;
 let pageUrl: string | undefined; // for mixed-content detection
+const contextFrames = new Map<number, string>(); // executionContextId -> frameId
 
 // ---- M7: lifecycle & load-time capture ----
 // The panel usually attaches AFTER the page loaded, so init-time requests
@@ -266,6 +272,7 @@ function clearDebugSessionState() {
   scripts.clear();
   mainFrameId = null;
   pageUrl = undefined;
+  contextFrames.clear();
   if (pausedState) {
     pausedState = null;
     post({ type: "resumed" }); // execution is effectively released
@@ -1291,17 +1298,19 @@ interface PageResourceOutcome {
   netError?: string;
 }
 
-/**
- * Fetch a URL in the PAGE's network context via CDP — with the page's
- * cookies/credentials, exactly like DevTools fetches source maps. This is
- * what makes maps on authenticated hosts resolve; a panel/extension-origin
- * fetch() has no page credentials and silently 401s. Falls back to a
- * credentialed extension fetch only if the CDP command itself is unavailable.
- */
-async function loadPageResource(url: string): Promise<PageResourceOutcome> {
+/** Self-signed/untrusted dev certs (the common `https://localhost:PORT` MFE
+ * remote case) surface as one of these net error names — distinct and
+ * actionable from a generic fetch failure. */
+function isTlsError(netError: string | undefined): boolean {
+  return !!netError && /ERR_CERT_|ERR_SSL_|ERR_BAD_SSL_CLIENT_AUTH_CERT/i.test(netError);
+}
+
+/** Fetch via CDP in a SPECIFIC frame's network context (cookies/credentials
+ * of that frame — not necessarily the top frame). */
+async function loadViaCdp(url: string, frameId: string | null): Promise<PageResourceOutcome> {
   try {
     const res = await sendCdp<LoadNetworkResourceResult>("Network.loadNetworkResource", {
-      ...(mainFrameId ? { frameId: mainFrameId } : {}),
+      ...(frameId ? { frameId } : {}),
       url,
       options: { disableCache: false, includeCredentials: true },
     });
@@ -1315,9 +1324,16 @@ async function loadPageResource(url: string): Promise<PageResourceOutcome> {
       netError:
         r.netErrorName ?? (r.netError !== undefined ? `net error ${r.netError}` : undefined),
     };
-  } catch {
-    // Command unavailable (old Chrome) or attachment raced away — fall through.
+  } catch (e) {
+    return { ok: false, netError: e instanceof Error ? e.message : String(e) };
   }
+}
+
+/** The service worker's own fetch — not subject to the PAGE's CSP or
+ * mixed-content rules, so it can often reach a local dev server the page
+ * context can't (and vice versa — kept as one option among several, never
+ * the only one). */
+async function workerFetch(url: string): Promise<PageResourceOutcome> {
   try {
     const resp = await fetch(url, { credentials: "include" });
     if (resp.ok) return { ok: true, content: await resp.text() };
@@ -1328,9 +1344,50 @@ async function loadPageResource(url: string): Promise<PageResourceOutcome> {
 }
 
 /**
- * Resolve a script's source map to raw JSON. Discovery is scriptParsed's
- * sourceMapURL (per-script — every MFE bundle/remote resolves independently);
- * inline data: URIs (webpack eval-source-map) decode locally with no network.
+ * Fetch a URL in the PAGE's network context via CDP — with the page's
+ * cookies/credentials, exactly like DevTools fetches source maps. This is
+ * what makes maps on authenticated hosts resolve; a panel/extension-origin
+ * fetch() has no page credentials and silently 401s. Used for the (simpler,
+ * non-map) original-source fetch path — source maps go through the fuller
+ * strategy chain in fetchSourceMapFor below.
+ */
+async function loadPageResource(url: string): Promise<PageResourceOutcome> {
+  const viaCdp = await loadViaCdp(url, mainFrameId);
+  if (viaCdp.ok) return viaCdp;
+  return workerFetch(url);
+}
+
+/** executionContextId -> frameId, when Runtime.executionContextCreated told us. */
+function frameForScript(script: ScriptInfo): string | null {
+  if (script.executionContextId === undefined) return null;
+  return contextFrames.get(script.executionContextId) ?? null;
+}
+
+// Last-resort discovery (strategy 5): scriptParsed carried no sourceMapURL,
+// but the script's OWN text might still end in the comment. This does NOT
+// replace scriptParsed.sourceMapURL as the primary discovery mechanism —
+// script text is fetched here only as a narrow fallback for the specific
+// scripts where the event gave us nothing to go on.
+const SOURCE_MAPPING_COMMENT_RE = /\/\/[#@][ \t]*sourceMappingURL=([^\s'"]+)[ \t]*$/m;
+
+async function commentScanForMapRef(scriptId: string): Promise<string | null> {
+  try {
+    const { scriptSource } = await sendCdp<{ scriptSource: string }>(
+      "Debugger.getScriptSource",
+      { scriptId },
+    );
+    return SOURCE_MAPPING_COMMENT_RE.exec(scriptSource)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve a script's source map to raw JSON, trying each strategy in turn
+ * and recording which one worked. Discovery is scriptParsed's sourceMapURL
+ * (per-script — every MFE bundle/remote resolves independently) with a
+ * comment-scan fallback only when that event gave us nothing; inline data:
+ * URIs (webpack eval-source-map) decode locally with no network at all.
  * Every failure returns an explicit reason — never a silent null.
  */
 async function fetchSourceMapFor(scriptId: string, requestToken: number) {
@@ -1345,19 +1402,34 @@ async function fetchSourceMapFor(scriptId: string, requestToken: number) {
       message: "Script is no longer in the registry (page navigated?)",
     });
   }
-  const ref = script.sourceMapURL;
+  let ref = script.sourceMapURL;
+  let viaCommentScan = false;
+  if (!ref) {
+    ref = (await commentScanForMapRef(scriptId)) ?? undefined;
+    viaCommentScan = !!ref;
+  }
   if (!ref) {
     return reply({
       ok: false,
       scriptId,
       reason: "no-map",
-      message: "Debugger.scriptParsed reported no sourceMapURL for this script",
+      message:
+        "Debugger.scriptParsed reported no sourceMapURL for this script, and no //# sourceMappingURL= comment was found in its source",
     });
   }
+
+  // Strategy 1: inline data: URI — no network at all.
   if (ref.startsWith("data:")) {
     const mapUrl = "(inline data: URI)";
     try {
-      return reply({ ok: true, scriptId, mapUrl, inline: true, mapJson: decodeDataUri(ref) });
+      return reply({
+        ok: true,
+        scriptId,
+        mapUrl,
+        inline: true,
+        mapJson: decodeDataUri(ref),
+        strategy: "inline",
+      });
     } catch (e) {
       return reply({
         ok: false,
@@ -1368,6 +1440,10 @@ async function fetchSourceMapFor(scriptId: string, requestToken: number) {
       });
     }
   }
+
+  // Relative refs resolve against the SCRIPT's own URL, never the page's —
+  // essential for MFE, where remote chunks live on a different origin than
+  // the container.
   let mapUrl: string;
   try {
     mapUrl = new URL(ref, script.url || undefined).href;
@@ -1388,9 +1464,25 @@ async function fetchSourceMapFor(scriptId: string, requestToken: number) {
       message: `Map URL is not fetchable: ${mapUrl}`,
     });
   }
-  const out = await loadPageResource(mapUrl);
+
+  // Strategy 2: CDP in the frame that actually loaded the script; retry
+  // against the top frame if that frame can't be determined or fails.
+  const scriptFrameId = frameForScript(script);
+  let out = await loadViaCdp(mapUrl, scriptFrameId ?? mainFrameId);
+  let strategy: SourceMapFetchStrategy = viaCommentScan ? "comment-scan" : "cdp-frame";
+  if (!out.ok && scriptFrameId && scriptFrameId !== mainFrameId && mainFrameId) {
+    const retry = await loadViaCdp(mapUrl, mainFrameId);
+    if (retry.ok) {
+      out = retry;
+      strategy = "cdp-top-frame";
+    }
+  }
   if (out.ok && out.content !== undefined) {
-    return reply({ ok: true, scriptId, mapUrl, inline: false, mapJson: out.content });
+    return reply({ ok: true, scriptId, mapUrl, inline: false, mapJson: out.content, strategy });
+  }
+
+  if (isTlsError(out.netError)) {
+    return tlsErrorReply(out.netError);
   }
   if (isMixedContent(pageUrl, mapUrl)) {
     return reply({
@@ -1404,17 +1496,57 @@ async function fetchSourceMapFor(scriptId: string, requestToken: number) {
         "Blocked as mixed content: this HTTPS page can't load an HTTP source map. Serve the remote (or its maps) over HTTPS, or use inline maps in dev.",
     });
   }
+
+  // Strategy 4: the service worker's own fetch — a different network/CSP
+  // context than the page, and often reaches a local dev server the page
+  // context can't (self-signed cert aside — see the TLS check below).
+  const workerOut = await workerFetch(mapUrl);
+  if (workerOut.ok && workerOut.content !== undefined) {
+    return reply({
+      ok: true,
+      scriptId,
+      mapUrl,
+      inline: false,
+      mapJson: workerOut.content,
+      strategy: "worker-fetch",
+    });
+  }
+  if (isTlsError(workerOut.netError)) {
+    return tlsErrorReply(workerOut.netError);
+  }
+
+  // Every worker-side strategy is exhausted. Strategy 3 (a panel-context
+  // fetch — different CORS story than the worker) is attempted by the panel
+  // itself (sourceMapResolver.ts) when it receives this failure with a
+  // resolved mapUrl, before giving up for good.
   return reply({
     ok: false,
     scriptId,
     reason: "fetch-failed",
     mapUrl,
-    httpStatus: out.httpStatus,
-    netError: out.netError,
-    message: out.httpStatus
-      ? `Map fetch failed: HTTP ${out.httpStatus}`
-      : `Map fetch failed: ${out.netError ?? "unknown network error"}`,
+    httpStatus: workerOut.httpStatus ?? out.httpStatus,
+    netError: workerOut.netError ?? out.netError,
+    message: (workerOut.httpStatus ?? out.httpStatus)
+      ? `Map fetch failed: HTTP ${workerOut.httpStatus ?? out.httpStatus}`
+      : `Map fetch failed: ${workerOut.netError ?? out.netError ?? "unknown network error"}`,
   });
+
+  function tlsErrorReply(netError: string | undefined) {
+    let origin = mapUrl;
+    try {
+      origin = new URL(mapUrl).origin;
+    } catch {
+      // keep the full URL if it somehow doesn't parse here
+    }
+    return reply({
+      ok: false,
+      scriptId,
+      reason: "tls-error",
+      mapUrl,
+      netError,
+      message: `TLS/cert error fetching the map from ${origin} — open that URL directly in a browser tab and accept the certificate, then retry.`,
+    });
+  }
 }
 
 /** Original-source fetch (map without sourcesContent) — same page-context path. */
@@ -1543,6 +1675,22 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         void rearmPersistedBreakpoints().then(() => syncGqlHook());
       }
       pushStatus();
+      break;
+    }
+    case "Runtime.executionContextCreated": {
+      // Builds executionContextId -> frameId so map fetches for MFE remote
+      // chunks can target the frame that actually loaded them, not always
+      // the top frame (see frameForScript / fetchSourceMapFor).
+      const p = params as unknown as {
+        context: { id: number; auxData?: { frameId?: string } };
+      };
+      if (p.context.auxData?.frameId) {
+        contextFrames.set(p.context.id, p.context.auxData.frameId);
+      }
+      break;
+    }
+    case "Runtime.executionContextsCleared": {
+      contextFrames.clear();
       break;
     }
     case "Debugger.scriptParsed": {

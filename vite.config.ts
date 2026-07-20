@@ -60,4 +60,7 @@ export default defineConfig({
       ],
     },
   },
+  build: {
+    modulePreload: false,
+  },
 });

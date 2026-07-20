@@ -1,3 +1,27 @@
+# Release 7 — v1.6.0 (2026-07-22)
+
+## Fix: source index empty for Module Federation remotes
+
+Diagnosed from a real failing run in an MFE app (container + 7-8 remotes, one served locally over HTTPS with a self-signed cert): `search_sources` kept returning `0 files scanned`, yet the agent still reported "73 in your code" from `get_stack` — a self-contradicting result. Root causes fixed:
+
+### The classifier was inventing "user" frames
+
+`classifyFrame` treated any unresolved, non-ignore-listed frame as `"user"` — so when a remote's source map failed to load, every one of its frames looked like confirmed developer code with nothing behind it. Classification is now **three states**: `"user"` (only ever earned via a successful source-map resolution), `"framework"` (ignore-listed), and `"unknown"` (unresolved — not confirmed as anything). The paused call chain now shows a distinct `? unknown` badge (reason on hover) instead of ever labeling these frames "your code," and reports per-class counts (`166 frames — 12 user, 81 framework, 73 unknown`) so a source-map problem is visually distinct from a stack that's genuinely all framework.
+
+### The source index is now observable and gates the agent
+
+"Find entry point" now **proactively indexes** every candidate script's map before running (not just the ones a stack frame happens to reference), then refuses to start if the index is empty — showing *"No original sources are indexed — source maps aren't loading"* with a link straight to diagnostics, instead of burning its whole tool budget rediscovering that fact. A **partial** index (some MFE origins resolved, one didn't) doesn't block, but shows a persistent warning naming the missing origin(s), and the agent's own context includes this so it reports the limitation instead of concluding "no matches." `search_sources` now returns an explicit `indexEmpty` signal when `filesScanned === 0`, and the system prompt makes clear that's a source-map problem, never evidence the code doesn't exist.
+
+### Multi-strategy source-map fetching for remotes
+
+Map acquisition now tries, per script, in order: inline `data:` decode → CDP fetch in the frame that **actually loaded the script** (via `Runtime.executionContextCreated`, not always the top frame) → CDP retry against the top frame → the service worker's own `fetch()` (a different CSP/mixed-content context than the page) → a panel-context `fetch()` (a different CORS story again) → last-resort `Debugger.getScriptSource` + trailing-comment scan, only when `scriptParsed` gave no `sourceMapURL` at all. **Self-signed/untrusted dev certs are now a distinct, actionable failure** ("TLS/cert error — open that URL directly and accept the certificate, then retry") instead of a generic fetch failure. Transient fetch failures are no longer cached permanently — only a genuine "no source map" or a success sticks — so a dev server that was down or a cert not yet accepted can succeed on the very next attempt without needing a manual Retry. Manifest gained explicit `https://localhost/*` and `https://127.0.0.1/*` host permissions alongside the existing `http://` ones.
+
+### Diagnostics: the number that should have made this obvious
+
+The Source Maps panel now leads with an index summary (*"indexed 0 original files from 0 scripts"*), auto-expands when the index is empty, and groups scripts under a **per-origin summary row** (`localhost:4202 — 0/14 resolved (TLS/certificate error)` vs `container-host — 22/22 resolved`) with per-origin Retry, plus which strategy resolved each script.
+
+---
+
 # Release 6 — v1.5.0 (2026-07-20)
 
 ## Network filters & search, "Find entry point" visibility

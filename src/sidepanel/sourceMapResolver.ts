@@ -1,6 +1,6 @@
 import { SourceMapConsumer } from "source-map";
 import mappingsWasmUrl from "source-map/lib/mappings.wasm?url";
-import type { CallFrame, SourceMapFetchResult } from "../shared/messages";
+import type { CallFrame, SourceMapFetchResult, SourceMapFetchStrategy } from "../shared/messages";
 
 // M2 rework: consumers are keyed by SCRIPT ID, not URL — eval'd Module
 // Federation modules have empty or webpack:// pseudo-URLs, so the URL is
@@ -24,7 +24,13 @@ export interface ResolvedFrame {
 // ---- Per-script resolution status (Fix 4: never fail silently) ----
 
 export type SourceMapStatus =
-  | { state: "resolved"; sourcesCount: number; mapUrl: string; inline: boolean }
+  | {
+      state: "resolved";
+      sourcesCount: number;
+      mapUrl: string;
+      inline: boolean;
+      strategy: SourceMapFetchStrategy;
+    }
   | { state: "no-map"; detail?: string } // scriptParsed had no sourceMapURL
   | {
       state: "fetch-failed";
@@ -32,6 +38,7 @@ export type SourceMapStatus =
       netError?: string;
       mapUrl: string;
       mixedContent?: boolean;
+      tlsError?: boolean;
     }
   | { state: "parse-failed"; error: string; mapUrl: string }
   | { state: "pending" };
@@ -60,10 +67,11 @@ export function describeSourceMapStatus(status: SourceMapStatus | undefined): st
   if (!status) return "source map not loaded yet";
   switch (status.state) {
     case "resolved":
-      return `map resolved (${status.sourcesCount} sources, ${status.inline ? "inline" : status.mapUrl})`;
+      return `map resolved via ${status.strategy} (${status.sourcesCount} sources, ${status.inline ? "inline" : status.mapUrl})`;
     case "no-map":
       return status.detail ?? "no source map";
     case "fetch-failed":
+      if (status.tlsError) return "map blocked: TLS/certificate error (untrusted dev-server cert?)";
       if (status.mixedContent) return "map blocked: mixed content (HTTPS page, HTTP map)";
       return `map fetch failed: ${
         status.httpStatus ?? status.netError ?? "network error"
@@ -118,6 +126,29 @@ function ensureInit(): Promise<boolean> {
 const consumerCache = new Map<string, Promise<SourceMapConsumer | null>>();
 const requestCache = new Map<string, Promise<ResolvedFrame[]>>();
 
+/**
+ * Strategy 3: a panel-context fetch — a different network/CORS story than
+ * both the page (worker strategy 2) and the service worker (strategy 4).
+ * Attempted only when the worker resolved an absolute URL to retry; a
+ * "no-map"/"unresolvable-url" failure has nothing to fetch.
+ */
+async function tryPanelFetch(
+  result: Extract<SourceMapFetchResult, { ok: false }>,
+): Promise<string | null> {
+  if (!result.mapUrl || result.reason === "no-map" || result.reason === "unresolvable-url") {
+    return null;
+  }
+  if (!/^https?:\/\//.test(result.mapUrl)) return null;
+  try {
+    const resp = await fetch(result.mapUrl, { credentials: "include", mode: "cors" });
+    if (resp.ok) return await resp.text();
+  } catch {
+    // CORS-blocked or network error from THIS context — the worker's failure
+    // reason is still the more informative one to show if this also fails.
+  }
+  return null;
+}
+
 async function loadConsumer(scriptId: string): Promise<SourceMapConsumer | null> {
   if (!(await ensureInit())) return null;
   if (!bridge) {
@@ -130,55 +161,101 @@ async function loadConsumer(scriptId: string): Promise<SourceMapConsumer | null>
   }
   setStatus(scriptId, { state: "pending" });
   const result = await bridge.fetchSourceMap(scriptId);
-  if (!result.ok) {
-    if (result.reason === "no-map" || result.reason === "unresolvable-url") {
-      setStatus(scriptId, { state: "no-map", detail: result.message });
-    } else {
+  if (result.ok) {
+    try {
+      const consumer = await new SourceMapConsumer(JSON.parse(result.mapJson));
       setStatus(scriptId, {
-        state: "fetch-failed",
-        mapUrl: result.mapUrl ?? "",
-        httpStatus: result.httpStatus,
-        netError: result.netError ?? result.message,
-        mixedContent: result.reason === "mixed-content",
+        state: "resolved",
+        sourcesCount: (consumer as unknown as { sources: string[] }).sources.length,
+        mapUrl: result.mapUrl,
+        inline: result.inline,
+        strategy: result.strategy,
       });
+      return consumer;
+    } catch (e) {
+      setStatus(scriptId, {
+        state: "parse-failed",
+        error: e instanceof Error ? e.message : String(e),
+        mapUrl: result.mapUrl,
+      });
+      return null;
     }
-    return null;
   }
-  try {
-    const consumer = await new SourceMapConsumer(JSON.parse(result.mapJson));
-    setStatus(scriptId, {
-      state: "resolved",
-      sourcesCount: (consumer as unknown as { sources: string[] }).sources.length,
-      mapUrl: result.mapUrl,
-      inline: result.inline,
-    });
-    return consumer;
-  } catch (e) {
-    setStatus(scriptId, {
-      state: "parse-failed",
-      error: e instanceof Error ? e.message : String(e),
-      mapUrl: result.mapUrl,
-    });
-    return null;
+
+  // Every worker-side strategy (inline / CDP-in-frame / CDP-top-frame /
+  // worker-fetch) failed — try strategy 3 from the panel itself before
+  // giving up. A mixed-content verdict is page-context-specific, so even
+  // that is worth one more attempt from here.
+  const panelJson = await tryPanelFetch(result);
+  if (panelJson !== null) {
+    try {
+      const consumer = await new SourceMapConsumer(JSON.parse(panelJson));
+      setStatus(scriptId, {
+        state: "resolved",
+        sourcesCount: (consumer as unknown as { sources: string[] }).sources.length,
+        mapUrl: result.mapUrl ?? "",
+        inline: false,
+        strategy: "panel-fetch",
+      });
+      return consumer;
+    } catch (e) {
+      setStatus(scriptId, {
+        state: "parse-failed",
+        error: e instanceof Error ? e.message : String(e),
+        mapUrl: result.mapUrl ?? "",
+      });
+      return null;
+    }
   }
+
+  if (result.reason === "no-map" || result.reason === "unresolvable-url") {
+    setStatus(scriptId, { state: "no-map", detail: result.message });
+  } else {
+    setStatus(scriptId, {
+      state: "fetch-failed",
+      mapUrl: result.mapUrl ?? "",
+      httpStatus: result.httpStatus,
+      netError: result.netError ?? result.message,
+      mixedContent: result.reason === "mixed-content",
+      tlsError: result.reason === "tls-error",
+    });
+  }
+  return null;
 }
 
 function getConsumer(scriptId: string): Promise<SourceMapConsumer | null> {
   if (!scriptId) return Promise.resolve(null);
-  let promise = consumerCache.get(scriptId);
-  if (!promise) {
-    promise = loadConsumer(scriptId).catch((e) => {
-      // Port died mid-fetch etc. — recorded in the status, cached as negative.
+  const cached = consumerCache.get(scriptId);
+  if (cached) return cached;
+  // `thisPromise` is only read inside the callbacks below, which run in a
+  // later microtask — by then the assignment (and the consumerCache.set two
+  // lines down) has already completed, so the self-reference resolves fine.
+  const thisPromise: Promise<SourceMapConsumer | null> = loadConsumer(scriptId)
+    .then((consumer) => {
+      // Only a SUCCESS or a genuine "no source map" negative is worth
+      // caching permanently. Every other failure (fetch/TLS/CORS/parse) is
+      // transient — a dev server that was down or an untrusted cert not yet
+      // accepted can succeed moments later — so drop it from the cache and
+      // let the next call retry from scratch. Guarded by identity so a
+      // concurrent retrySourceMap() that already installed a newer promise
+      // is never clobbered by this settling late.
+      if (consumer === null && statuses[scriptId]?.state !== "no-map") {
+        if (consumerCache.get(scriptId) === thisPromise) consumerCache.delete(scriptId);
+      }
+      return consumer;
+    })
+    .catch((e) => {
+      // Port died mid-fetch etc. — recorded in the status, NOT cached.
       setStatus(scriptId, {
         state: "fetch-failed",
         mapUrl: "",
         netError: e instanceof Error ? e.message : String(e),
       });
+      if (consumerCache.get(scriptId) === thisPromise) consumerCache.delete(scriptId);
       return null;
     });
-    consumerCache.set(scriptId, promise);
-  }
-  return promise;
+  consumerCache.set(scriptId, thisPromise);
+  return thisPromise;
 }
 
 /**
