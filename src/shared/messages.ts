@@ -81,6 +81,13 @@ export interface PausedFrame {
 }
 
 export interface PausedSnapshot {
+  // Stable per LOGICAL pause, even across multiple "paused" messages for the
+  // same pause (e.g. the GraphQL-operation detail refinement re-sends this
+  // snapshot once the matched operation name resolves). Every "paused"
+  // message is a fresh object after structured-clone across the port, so
+  // consumers that need "is this still the same pause" must compare pauseId,
+  // never object identity.
+  pauseId: number;
   // "other" for line breakpoints, "XHR" for XHR breakpoints, ... Synthesized
   // worker-side: "GraphQLOperation" for the in-page GraphQL hook's pauses.
   reason: string;

@@ -304,7 +304,13 @@ export default function Debugger({
   );
 
   // Re-resolve the stack (via the M2 consumer cache) whenever a pause lands.
-  // Keyed by scriptId, so eval'd/webpack:// frames resolve too.
+  // Keyed by scriptId, so eval'd/webpack:// frames resolve too. Depends on
+  // pauseId, not the paused object itself: GraphQL-operation pauses re-send
+  // a "paused" message once the matched operation name resolves a moment
+  // later, and every port message is a fresh object after structured-clone
+  // even for the SAME logical pause — keying on identity would snap the
+  // selected frame back to 0 and re-resolve needlessly right after the user
+  // picked a frame.
   useEffect(() => {
     setSelectedFrame(0);
     if (!paused) {
@@ -322,7 +328,8 @@ export default function Debugger({
     return () => {
       cancelled = true;
     };
-  }, [paused]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paused?.pauseId]);
 
   // ---- M7: shared discovery pipeline (classifier → entry point → arm) ----
   // The classifier runs on EVERY pause's stack; only the trigger differs

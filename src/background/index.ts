@@ -142,6 +142,9 @@ let gqlHookScriptId: string | null = null;
 let gqlHookInstalled = false;
 const scripts = new Map<string, ScriptInfo>(); // scriptId -> info
 let pausedState: PausedSnapshot | null = null;
+// Stamped onto every NEW pausedState (never on the GraphQL detail-refinement
+// re-post, which mutates the same object) — see PausedSnapshot.pauseId.
+let pauseSeq = 0;
 // Network.loadNetworkResource needs the frame whose network context (cookies,
 // credentials) the fetch should run in — always the main frame here.
 let mainFrameId: string | null = null;
@@ -1617,6 +1620,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         scopeChain: [],
       }));
       pausedState = {
+        pauseId: ++pauseSeq,
         reason,
         detail,
         hitBreakpoints: p.hitBreakpoints ?? [],

@@ -175,14 +175,20 @@ export default function EntryPointPanel({
   const runningRef = useRef(false);
 
   // A NEW pause is a new investigation context: reset the panel (the
-  // cross-pause result cache in the agent module is unaffected).
+  // cross-pause result cache in the agent module is unaffected). Keyed on
+  // pauseId, NOT the paused object itself — every "paused" message is a
+  // fresh object after structured-clone across the port, even for the SAME
+  // logical pause (GraphQL-operation pauses re-send once the matched
+  // operation name resolves a moment later). Keying on identity would abort
+  // an investigation that had just started from that first click.
   useEffect(() => {
     abortRef.current?.abort();
     setPhase("idle");
     setSteps([]);
     setResult(null);
     setArmNote(null);
-  }, [paused]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paused.pauseId]);
 
   useEffect(() => {
     if (!runningRef.current) return;
