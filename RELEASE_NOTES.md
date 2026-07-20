@@ -1,3 +1,29 @@
+# Release 6 — v1.5.0 (2026-07-20)
+
+## Network filters & search, "Find entry point" visibility
+
+### Network request filters
+
+A compact filter bar above the request list. **Type chips** (All / Fetch-XHR / GraphQL / JS / CSS / Img / Font / Doc / WS / Other — GraphQL is the existing `graphql.isGraphQL` metadata, not a raw CDP type) are multi-select with live counts; zero-count chips hide themselves unless active. A collapsible **"More filters"** row adds Method, Status (2xx/3xx/4xx/5xx/Pending), GraphQL operation type (only when GraphQL requests exist), and Origin (only when more than one — the MFE case). Filters compose (AND across categories, OR within one), show `Showing X of Y requests` plus a one-click **Clear all**, and persist per **session** (`chrome.storage.session` — survives panel re-open, not tied to a site). Filtering is strictly display-only; nothing is ever dropped from captured state.
+
+*(Deliberately not built: a "has GraphQL errors" filter — it would require fetching and parsing response bodies, which conflicts with reusing existing metadata only. Flag if you want it as a follow-up.)*
+
+### Network request search
+
+A search box in the same bar matches URL, method, status, GraphQL operation name/type, query text, and variables (stringified) — so searching a field name inside a query, or an id inside variables, finds the right call even though every GraphQL request shares one URL. Batched requests match if *any* operation matches. Debounced (~150ms), composes with filters, matches are `<mark>`-highlighted in the row, and a `matched: query` hint badge appears when the only hit is in content not shown in the row (query/variables/operation type). Space-separated terms AND together; a leading `-` excludes. `Ctrl/Cmd+F` focuses the box (scoped to the panel — the browser's own find is useless here).
+
+### "Find entry point" visibility
+
+The agent's progress used to render below the fold — clicking looked like nothing happened. Now:
+- The button itself goes into a disabled+spinner state on the **same render** as the click, before any async work starts.
+- The progress box sits **directly below the control row** (not at the bottom of the paused view) and auto-scrolls into view the instant a run starts.
+- A **sticky status line** (spinner, current step in plain language, elapsed time, Cancel) pins to the top of the whole Debug view — rendered by `Debugger.tsx` itself from a status the panel reports up, so it stays visible however far down the user has scrolled (Breakpoints, Lifecycle, …), not just within the panel's own height.
+- The step log auto-follows the latest step, but stops the instant the user scrolls up manually (with a "↓ jump to latest" pill to resume).
+- A tool call running past ~2s gets an inline "— still working…" suffix, and the gap between tool calls shows "Deciding next step…" — the log never looks frozen.
+- On completion (found, partial, cancelled, or error alike) the step log collapses behind a "How this was found" toggle and the **result** scrolls into view — the answer is what the user lands on.
+
+---
+
 # Release 5 — v1.4.0 (2026-07-15)
 
 ## "Find entry point" (agentic) + call-stack display & navigation

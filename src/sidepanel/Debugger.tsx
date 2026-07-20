@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type {
   BreakpointInfo,
   CapturedRequest,
@@ -16,7 +16,7 @@ import type {
 } from "../shared/messages";
 import type { ModelConfigState } from "./modelConfig";
 import type { EntryCandidate } from "./entryPointAgent";
-import EntryPointPanel from "./EntryPointPanel";
+import EntryPointPanel, { type AgentRunStatus } from "./EntryPointPanel";
 import { fileNameOf, originLabelOf, prettySourcePath } from "./framePath";
 import {
   describeSourceMapStatus,
@@ -291,6 +291,18 @@ export default function Debugger({
   const [explaining, setExplaining] = useState(false);
   // Bumped by the "Find entry point" buttons; the panel runs on change.
   const [agentNonce, setAgentNonce] = useState<number | null>(null);
+  // Drives the button's own disabled+spinner state immediately on click —
+  // set synchronously in the click handler, not waiting on EntryPointPanel's
+  // effect round-trip, so no frame after the click looks unchanged.
+  const [agentRunning, setAgentRunning] = useState(false);
+  // Live status for the sticky bar (rendered here, spanning the WHOLE
+  // scrollable Debug view) — EntryPointPanel reports it because a bar sticky
+  // inside that component would only stay pinned within its own short
+  // height, not while scrolled down at Breakpoints/Lifecycle/etc.
+  const [agentStatus, setAgentStatus] = useState<AgentRunStatus | null>(null);
+  // Scrolled into view the instant "Find entry point" is clicked, so the
+  // user never has to hunt for it.
+  const progressAnchorRef = useRef<HTMLDivElement | null>(null);
 
   // Track defaults for the resolved framework; the user can edit before Apply.
   useEffect(() => {
@@ -331,6 +343,19 @@ export default function Debugger({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paused?.pauseId]);
 
+  // A fresh pause invalidates any in-flight "Find entry point" state that
+  // was tracked here (the agent's own reset is keyed on the same pauseId).
+  // agentNonce must reset too — not just agentRunning/agentStatus — because
+  // EntryPointPanel treats "startNonce !== null" as "a click happened for
+  // THIS pause"; back-to-back pauses without an intervening resume keep the
+  // component mounted, so a stale nonce from the previous pause would make
+  // it render as "running" again before the user clicked anything.
+  useEffect(() => {
+    setAgentRunning(false);
+    setAgentStatus(null);
+    setAgentNonce(null);
+  }, [paused?.pauseId]);
+
   // ---- M7: shared discovery pipeline (classifier → entry point → arm) ----
   // The classifier runs on EVERY pause's stack; only the trigger differs
   // (interaction breakpoints step in early, request breakpoints — XHR/GraphQL
@@ -364,7 +389,21 @@ export default function Debugger({
   // The agentic "Find entry point" (tool loop over live scopes + sources)
   // replaced the old one-shot stack-text prompt: it grounds its answer in
   // checkable tool results instead of guessing from frame names.
-  const startFindEntryPoint = () => setAgentNonce(Date.now());
+  const startFindEntryPoint = () => {
+    // Synchronous, same-tick state update — the button reflects "running"
+    // on the very next paint, without waiting for EntryPointPanel's effect.
+    setAgentRunning(true);
+    setAgentNonce(Date.now());
+  };
+
+  // Auto-scroll the progress box into view the instant a run starts —
+  // whichever "Find entry point" button was clicked (there are two: the
+  // main control row and the broken-chain fallback).
+  useEffect(() => {
+    if (agentNonce !== null) {
+      progressAnchorRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [agentNonce]);
 
   const addXhrBreakpoint = () => {
     const url = xhrInput.trim();
@@ -458,6 +497,24 @@ export default function Debugger({
 
   return (
     <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-3">
+      {/* Sticky live-status line: a direct child of the SCROLLABLE container
+          (not nested inside the paused section) so it stays pinned at the
+          top regardless of how far down the user has scrolled — Breakpoints,
+          Lifecycle, XHR breakpoints, all of it. Negative margins bleed it to
+          the container's edges for a flush slim bar. */}
+      {agentStatus && (
+        <div className="sticky top-0 z-20 -mx-3 -mt-3 mb-2 flex items-center gap-2 bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white shadow">
+          <span className="animate-spin">⟳</span>
+          <span className="min-w-0 flex-1 truncate">{agentStatus.currentStepLabel}</span>
+          <span className="shrink-0 opacity-80">{agentStatus.elapsedSec}s</span>
+          <button
+            className="shrink-0 rounded bg-white/20 px-2 py-0.5 hover:bg-white/30"
+            onClick={agentStatus.onCancel}
+          >
+            Cancel
+          </button>
+        </div>
+      )}
       {paused && (
         <section className="rounded border border-amber-300 bg-amber-50 p-2">
           <div className="flex flex-wrap items-center gap-2">
@@ -485,12 +542,39 @@ export default function Debugger({
               {explaining ? "Preparing…" : "Explain this pause"}
             </button>
             <button
-              className="rounded bg-emerald-600 px-2 py-1 text-xs font-medium text-white hover:bg-emerald-700"
+              className="rounded bg-emerald-600 px-2 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-70"
               title="AI agent (read-only tools) traces this request back to the function in YOUR code that originated it — inspects frame scopes, finds your objects, and verifies against your original sources"
+              disabled={agentRunning}
               onClick={startFindEntryPoint}
             >
-              Find entry point
+              {agentRunning ? (
+                <>
+                  <span className="inline-block animate-spin">⟳</span> Finding entry point…
+                </>
+              ) : (
+                "Find entry point"
+              )}
             </button>
+          </div>
+
+          {/* Directly below the control row — the action and its output stay
+              visually connected — and the auto-scroll target on click. */}
+          <div ref={progressAnchorRef}>
+            <EntryPointPanel
+              paused={paused}
+              scripts={scripts}
+              requests={requests}
+              framework={framework}
+              ignorePatterns={ignoreList}
+              config={config}
+              fetchProperties={fetchProperties}
+              startNonce={agentNonce}
+              onOpenSource={onOpenSource}
+              onBreakAt={onBreakAtCandidate}
+              onOpenSettings={onOpenSettings}
+              onOpenSourcesTab={onOpenSourcesTab}
+              onStatusChange={setAgentStatus}
+            />
           </div>
 
           <h3 id="paused-call-chain" className="mt-2 text-xs font-semibold text-gray-700">
@@ -670,30 +754,16 @@ export default function Debugger({
                   Break on lifecycle ↓
                 </button>
                 <button
-                  className="rounded bg-emerald-600 px-2 py-1 text-xs font-medium text-white hover:bg-emerald-700"
+                  className="rounded bg-emerald-600 px-2 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-70"
                   title="AI agent with read-only tools: inspects the paused scopes for your objects and verifies the origin in your sources — every claim grounded in checkable evidence"
+                  disabled={agentRunning}
                   onClick={startFindEntryPoint}
                 >
-                  Find entry point
+                  {agentRunning ? "Finding entry point…" : "Find entry point"}
                 </button>
               </div>
             </div>
           )}
-
-          <EntryPointPanel
-            paused={paused}
-            scripts={scripts}
-            requests={requests}
-            framework={framework}
-            ignorePatterns={ignoreList}
-            config={config}
-            fetchProperties={fetchProperties}
-            startNonce={agentNonce}
-            onOpenSource={onOpenSource}
-            onBreakAt={onBreakAtCandidate}
-            onOpenSettings={onOpenSettings}
-            onOpenSourcesTab={onOpenSourcesTab}
-          />
 
           <h3 className="mt-2 text-xs font-semibold text-gray-700">Scope</h3>
           {paused.callFrames[selectedFrame]?.scopeChain

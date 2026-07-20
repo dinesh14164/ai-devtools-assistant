@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   PORT_NAME,
   type BgToPanel,
@@ -44,6 +44,19 @@ import Debugger, {
 import SourcesView, { type SourcesNavTarget } from "./SourcesView";
 import { fileNameOf, originLabelOf, prettySourcePath } from "./framePath";
 import type { EntryCandidate } from "./entryPointAgent";
+import NetworkFilterBar from "./NetworkFilterBar";
+import {
+  EMPTY_FILTER_STATE,
+  hasHiddenMatch,
+  hiddenMatchFields,
+  highlightParts,
+  loadFilterSession,
+  matchesFilters,
+  saveFilterSession,
+  searchRequest,
+  SEARCH_FIELD_LABELS,
+  type FilterState,
+} from "./networkFilter";
 import {
   DEFAULT_QUESTIONS,
   type Attachment,
@@ -101,6 +114,24 @@ function formatVariables(variables: unknown): string {
   } catch {
     return String(variables);
   }
+}
+
+/** Renders `text` with active search terms wrapped in <mark> (Part B). */
+function Highlighted({ text, query }: { text: string; query: string }) {
+  if (!query.trim()) return <>{text}</>;
+  return (
+    <>
+      {highlightParts(text, query).map((p, i) =>
+        p.match ? (
+          <mark key={i} className="rounded-sm bg-yellow-200 px-0.5 text-inherit">
+            {p.text}
+          </mark>
+        ) : (
+          <span key={i}>{p.text}</span>
+        ),
+      )}
+    </>
+  );
 }
 
 function FrameRow({
@@ -269,6 +300,10 @@ export default function App() {
   );
   // Pending "open original file at line" navigation for the Sources tab.
   const [sourcesNav, setSourcesNav] = useState<SourcesNavTarget | null>(null);
+  // Network filters + search (Part A/B) — display-only, session-persisted.
+  const [filters, setFilters] = useState<FilterState>(EMPTY_FILTER_STATE);
+  const [search, setSearch] = useState("");
+  const filterSessionLoadedRef = useRef(false);
   const attachmentIdRef = useRef(0);
   // What the next element pick is for: chat attachment (default) or finding
   // an element's event handlers to break on.
@@ -286,6 +321,21 @@ export default function App() {
   useEffect(() => {
     void getConfig().then(setConfig);
   }, []);
+
+  // Filters/search persist per session (chrome.storage.session — survives
+  // panel re-open, cleared on browser restart), not per origin.
+  useEffect(() => {
+    void loadFilterSession().then((session) => {
+      setFilters(session.filters);
+      setSearch(session.search);
+      filterSessionLoadedRef.current = true;
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!filterSessionLoadedRef.current) return; // don't clobber storage with defaults pre-hydration
+    saveFilterSession({ filters, search });
+  }, [filters, search]);
 
   useEffect(() => {
     const port = chrome.runtime.connect({ name: PORT_NAME });
@@ -541,6 +591,29 @@ export default function App() {
   }, [selectedId]);
 
   const send = (msg: PanelToBg) => portRef.current?.postMessage(msg);
+
+  // Filtering/search compose (AND): filters narrow the bucket, search then
+  // narrows further — display-only, `requests` itself is never touched.
+  const searching = search.trim() !== "";
+  const visibleRequests = useMemo(
+    () =>
+      requests.filter(
+        (r) => matchesFilters(r, filters) && (!searching || searchRequest(r, search).matched),
+      ),
+    [requests, filters, searching, search],
+  );
+  const matchMap = useMemo(
+    () =>
+      searching
+        ? new Map(visibleRequests.map((r) => [r.requestId, searchRequest(r, search)] as const))
+        : null,
+    [searching, visibleRequests, search],
+  );
+  const clearAllFilters = () => {
+    setFilters(EMPTY_FILTER_STATE);
+    setSearch("");
+  };
+
   const selected = requests.find((r) => r.requestId === selectedId) ?? null;
   // While resolution is in flight, show the raw frames so the pane never blocks.
   const displayFrames: ResolvedFrame[] | null = selected
@@ -1020,14 +1093,37 @@ export default function App() {
       {/* All views stay mounted so chat streaming and list state survive tab
           switches; visibility is CSS-only. */}
       <div className={view === "network" ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
+        <NetworkFilterBar
+          requests={requests}
+          visibleCount={visibleRequests.length}
+          totalCount={requests.length}
+          filters={filters}
+          onFiltersChange={setFilters}
+          search={search}
+          onSearchChange={setSearch}
+          onClearAll={clearAllFilters}
+        />
         <ul className="min-h-0 flex-1 divide-y divide-gray-100 overflow-y-auto">
           {requests.length === 0 && (
             <li className="p-3 text-gray-500">No requests captured yet.</li>
           )}
-          {requests.map((r) => {
+          {requests.length > 0 && visibleRequests.length === 0 && (
+            <li className="p-3 text-gray-500">
+              {searching ? "No requests match your search." : "No requests match these filters."}{" "}
+              <button
+                className="font-medium text-blue-700 hover:underline"
+                onClick={clearAllFilters}
+              >
+                Clear all
+              </button>
+            </li>
+          )}
+          {visibleRequests.map((r) => {
             const isGraphQL = !!r.graphql;
             const firstType = r.graphql?.operations[0]?.operationType;
             const displayLabel = isGraphQL ? deriveGraphQLDisplay(r.graphql!) : r.url;
+            const match = matchMap?.get(r.requestId);
+            const hiddenHint = match && hasHiddenMatch(match.fields);
             return (
               <li key={r.requestId}>
                 <button
@@ -1051,9 +1147,13 @@ export default function App() {
                     title={isGraphQL ? r.url : undefined}
                   >
                     {isGraphQL ? (
-                      <span className="font-medium">{displayLabel}</span>
+                      <span className="font-medium">
+                        <Highlighted text={displayLabel} query={search} />
+                      </span>
                     ) : (
-                      <bdi>{r.url}</bdi>
+                      <bdi>
+                        <Highlighted text={r.url} query={search} />
+                      </bdi>
                     )}
                     {isGraphQL && (
                       <span className="ml-2 text-xs text-gray-400">
@@ -1061,6 +1161,14 @@ export default function App() {
                       </span>
                     )}
                   </span>
+                  {hiddenHint && (
+                    <span
+                      className="shrink-0 rounded bg-amber-100 px-1 py-px text-[9px] font-semibold text-amber-700"
+                      title="This request matched on content not shown in the row"
+                    >
+                      matched: {hiddenMatchFields(match!.fields).map((f) => SEARCH_FIELD_LABELS[f]).join(", ")}
+                    </span>
+                  )}
                   <span className="shrink-0 text-xs text-gray-500">
                     {r.status ?? "…"}
                   </span>
